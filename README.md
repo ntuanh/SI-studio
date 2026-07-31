@@ -63,96 +63,103 @@ way the toggle is set. The toggle only decides where the *numbers* come from.
 
 ## The Control tab — the whole fleet on one screen
 
-A terminal with a fleet attached. Work down the page.
+![The Control tab: the Control server card and the Targets list down the left,
+the command line, the file transfer card and the consoles down the
+right](docs/img/ui-control.png)
 
-### 1 · Control server — the machine you log into first
+Left column is *who*, right column is *what*. Read it card by card.
 
-Fill in the address, SSH port, user and password, then press **Connect (SSH)**.
-The dot beside the card title goes green when the login works.
+**Control server** — the machine you log into first. Address, SSH port, user,
+password, then **Connect (SSH)**; the dot by the title goes green when the login
+works.
 
-- **Reach devices through this server** — tick this when your edge and cloud
-  boxes sit on a private network. Every device is then dialled *through* this
-  machine, so `10.0.1.x` addresses your laptop cannot reach still work.
-- **Broker (RabbitMQ) · optional** — the folded strip underneath. You only need
-  it to actually run split inference. *Check broker + control API too* tests all
-  three legs and reports each one: `ssh ✓ · amqp ✓ · api ✓`.
-- Once connected, collapse the card with the caret at its top right. It is
-  settings you set once, and it pushes the target list off screen.
+- **Reach devices through this server** — tick it when your edge and cloud boxes
+  are on a private network. Every device is then dialled *through* this machine,
+  so the `10.0.1.x` addresses your laptop cannot route to still work. (That is
+  what the `jump host` tag under the first target means.)
+- **Broker (RabbitMQ) · optional** — the folded strip at the bottom. Only needed
+  to actually run split inference. Its *check broker + control API too* button
+  tests all three legs and reports each: `ssh ✓ · amqp ✓ · api ✓`.
+- Collapse the card once it is connected — settings you set once should not push
+  the target list off screen.
 
-### 2 · Targets — who the next command goes to
+**Targets** — who the next command goes to. Devices are grouped by stage, each
+group has its own **select all**, and the header counts what is ticked. The
+control server is a group of its own at the top, so you can aim at it exactly
+like a device. The ⚙ on a row opens that device's login form, with **copy login**
+/ **paste** so the second machine is not retyped.
 
-Devices are grouped by stage, and each group has its own **select all**. The
-header counts what is ticked. The control server is a group of its own at the
-top, so you can aim at it exactly like a device.
-
-The ⚙ on a row opens that device's login form, with **copy login** / **paste**
-so the second machine is not retyped.
-
-### 3 · The command line
-
-A `$` box with a working-directory box in front of it. Every command gets a fresh
-shell, so `cd` on its own cannot stick — set the directory here instead. The chips
-underneath are your saved commands: click one to load it, **edit** to change the
-list (and the directory shortcuts). Then **▶ Run**.
+**Run command on N device(s)** — the chips are your saved commands (**edit**
+changes the list), the **directory** row is where they run, and the `$` box is
+free-form. `cd` on its own cannot stick, because every command gets a fresh
+shell — that is what the directory row is for.
 
 | If you want to | Do this |
 |---|---|
-| Start something long (`python3 src/Server.py`) | Just run it. The call returns straight away and the output keeps streaming |
-| Stop it | Type `^C` in the command box and press Run |
+| Start something long (`python3 src/Server.py`) | Just run it. The call returns at once and the output keeps streaming |
+| Stop it | Type `^C` in the command box and press **▶ Run** |
 | Reboot, or restart an agent | Run it — you get a confirmation prompt first |
-| Run something not on the allow-list | It is refused, and the message lists what is allowed |
+| Run something off the allow-list | It is refused, and the message lists what is allowed |
 
-### 4 · Files — push to many, pull from one
+**Files** — the top row pushes one file to every ticked device; the bottom row
+works on a single one. **browse** lists a directory (click a folder to go deeper,
+a file to fill the box), **⇩ Pull** downloads it to your machine.
 
-The top row sends a file to every ticked device. The bottom row works on a single
-device: **browse** lists a directory (click a folder to go deeper, a file to fill
-the box), **⇩ Pull** downloads it to your machine.
+**Consoles** — the big one is every target at once. The strip on the right is one
+small console per machine; click one to promote it to the big view.
 
-### 5 · Consoles
-
-The big console is a fan-out view of every target at once. The strip beside it is
-one small console per machine — click one to promote it to the big view, **clear**
-to empty it.
-
-### Two buttons in the header belong to this work
-
-- **⟳ measure all** — SSH into every device and replace its guessed specs
-  (GFLOPS, MB/s, latency) with timed ones. Each stage has its own **⟳ measure**.
-- **⇧ Deploy** — push the model shards and agents to every cluster. Deploy first,
-  then run.
+Two header buttons belong to this work: **⟳ measure all** SSHs into every device
+and replaces its guessed specs with timed ones, and **⇧ Deploy** pushes the model
+shards and agents to every cluster. Deploy first, then run.
 
 ## The Visual tab — what the run actually did
 
-A run leaves a directory of plain-text logs on the device. This tab turns that
+A run leaves a directory of plain-text logs on a device. This tab turns that
 directory into charts.
 
-1. **Point at it.** The path box takes a directory on the device; **browse** walks
-   the filesystem if you do not remember it.
-2. **Name it.** *Case test* is how you will recognise this run in a week —
+![The Visual tab: the path and case-test row, the History bar, and the row of
+headline tiles](docs/img/ui-visual.png)
+
+1. **Point at the directory** — or **browse** to it if you do not remember it.
+2. **Name it.** *Case test* is how you will recognise this run in a week:
    `cut6-8bit` beats `run7`.
-3. **Press Analyze.** The backend reads the logs, picks a chart form per metric
-   (a reading over time becomes a trend; a single number becomes a tile rather
-   than a one-bar bar chart), draws them, and sends the images back.
+3. **Analyze.** The backend reads the logs and picks a chart form per metric — a
+   reading over time becomes a trend, a single number becomes a tile rather than
+   a one-bar bar chart — draws them, and sends the images back.
 
-What comes back:
+The tiles across the top are the numbers that *are* the story. Everything below
+them is the gallery, one card per chart.
 
-| | |
-|---|---|
-| **Tiles** | The numbers that are the story, across the top. The change is written in words, not just colour |
-| **Gallery** | Every chart, numbered and tagged by kind — trend, comparison, distribution, delta, breakdown. Click one to open it full size |
-| **⚙ on a chart** | Hide a series, rename the title or either axis, then **Apply** — the backend redraws it. **Reset** puts it back. The gear takes on colour once a chart differs from the default |
-| **Note box** | Under every chart, for what that chart showed |
-| **Review** | One line at the bottom, for the run as a whole |
+### A chart card
 
-**⇩ Save report** writes the notes and review beside the images, so the reading
-outlives the browser tab.
+![One chart card with its settings panel open: series pills, title and axis
+boxes, Apply and Reset, the chart, and the note box](docs/img/ui-visual-chart.png)
 
-**History** browses what you saved: pick a day, then a run from that day. The ✎
+The number (`01`) is the catalogue position and is stable across re-runs. The
+chip says what kind of chart it is — trend, comparison, distribution, delta,
+breakdown. Click the image to open it full size.
+
+**⚙** opens the settings panel: switch a series off, rename the title or either
+axis, then **Apply** and the backend redraws the PNG. **Reset** puts it back to
+the guide's default. The gear takes on colour once a chart has been changed, so
+you can see which ones you touched without opening them.
+
+The box at the foot of the card is that chart's note. There is a **Review** line
+for the whole run at the bottom of the tab, and **⇩ Save report** writes both
+beside the images — so the reading outlives the browser tab.
+
+**History** browses what you saved: pick a day, then a run from that day. A ✎
 marks a run that was actually reviewed; ✕ deletes one.
 
-**Compare** pins up to three reports side by side. Charts line up row by row and
-tiles are matched by label, so "did the new cut help?" is one screen. ← and →
-step through the charts, Esc returns to the full stack.
+### Comparing two runs
+
+![Compare mode: two reports pinned side by side, headline numbers matched by
+label, and the same chart drawn from each run](docs/img/ui-visual-compare.png)
+
+**⧉ Compare runs**, then click runs in History to pin up to three. Tiles are
+matched by label and charts line up by catalogue number, so "did the new cut
+help?" is one screen. **▦ all** stacks every chart; a chip picks one; ← and →
+step through them and Esc returns to the full stack.
 
 ## Where reports live
 
