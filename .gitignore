@@ -1,4 +1,4 @@
-# Claude Code local permission allow-list -- machine-specific
+# Local editor/tooling config -- machine-specific
 .claude/
 
 # Editor-local workspace file
