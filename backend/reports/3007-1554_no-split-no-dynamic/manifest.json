@@ -1,0 +1,335 @@
+{
+  "id": "3007-1554_no-split-no-dynamic",
+  "case_name": "no split no dynamic",
+  "created_at": "2026-07-30T15:54:45",
+  "label": "30 Jul 15:54",
+  "device_id": "__server__",
+  "device_name": "Control server",
+  "source_path": "ntuanh/Optimizer/split_inference_test/results/results_0730_1105_split",
+  "charts": [
+    {
+      "id": "throughput_by_cluster",
+      "file": "01_throughput_by_cluster.png",
+      "title": "Throughput by cluster",
+      "kind": "comparison",
+      "subtitle": "SYSTEM carries no steady-state figure — it is a per-cluster measure",
+      "summary": "intermediate_queue 4.79 FPS (100% of batches); System 4.79 FPS",
+      "metrics": [
+        "fps",
+        "steady_fps",
+        "share"
+      ],
+      "wide": false,
+      "note": ""
+    },
+    {
+      "id": "system_window_fps",
+      "file": "02_system_window_fps.png",
+      "title": "System throughput over the run",
+      "kind": "trend",
+      "subtitle": "2 split-point change(s) marked",
+      "summary": "489 readings over 827s; mean 4.67 FPS, peak 5.46, settles at 3.93",
+      "metrics": [
+        "window_fps"
+      ],
+      "wide": true,
+      "note": ""
+    },
+    {
+      "id": "cluster_window_fps",
+      "file": "03_cluster_window_fps.png",
+      "title": "Throughput per cluster over the run",
+      "kind": "trend",
+      "subtitle": "31-reading rolling mean — the spread is chart 04",
+      "summary": "intermediate_queue mean 5.14 FPS",
+      "metrics": [
+        "window_fps"
+      ],
+      "wide": true,
+      "note": ""
+    },
+    {
+      "id": "window_fps_distribution",
+      "file": "04_window_fps_distribution.png",
+      "title": "Window FPS distribution by cluster",
+      "kind": "distribution",
+      "subtitle": "outliers suppressed — the series are dense",
+      "summary": "intermediate_queue median 5.20, IQR 5.13–5.26 FPS",
+      "metrics": [
+        "window_fps"
+      ],
+      "wide": false,
+      "note": ""
+    },
+    {
+      "id": "service_latency_by_role",
+      "file": "05_service_latency_by_role.png",
+      "title": "Service latency by device role",
+      "kind": "comparison",
+      "subtitle": "each panel keeps its own scale — the roles differ by an order of magnitude",
+      "summary": "slowest: edge in intermediate_queue at 51,107 ms mean",
+      "metrics": [
+        "mean_ms",
+        "p95_ms"
+      ],
+      "wide": true,
+      "note": ""
+    },
+    {
+      "id": "e2e_latency_profile",
+      "file": "06_e2e_latency_profile.png",
+      "title": "End-to-end latency profile",
+      "kind": "comparison",
+      "subtitle": "one scale across the panels — the same measure, so they must be comparable",
+      "summary": "system mean 73.8 s, p95 132.5 s over 504 samples",
+      "metrics": [
+        "mean_ms",
+        "p50_ms",
+        "p95_ms",
+        "max_ms"
+      ],
+      "wide": false,
+      "note": ""
+    },
+    {
+      "id": "utilization_by_role",
+      "file": "07_utilization_by_role.png",
+      "title": "Device utilization by cluster and role",
+      "kind": "comparison",
+      "subtitle": "pooled Σbusy/Σtotal, so a long-running device counts for more",
+      "summary": "intermediate_queue cloud 43.8%; intermediate_queue edge 68.9%; System all 61.6%",
+      "metrics": [
+        "utilization"
+      ],
+      "wide": false,
+      "note": ""
+    },
+    {
+      "id": "device_utilization",
+      "file": "08_device_utilization.png",
+      "title": "Per-device utilization",
+      "kind": "comparison",
+      "subtitle": "ranked inside each role — a lone short bar is a straggler",
+      "summary": "12 devices, 43.3%–80.9%; quietest is cloud at 43.3%",
+      "metrics": [
+        "utilization"
+      ],
+      "wide": true,
+      "note": ""
+    },
+    {
+      "id": "map_by_window",
+      "file": "09_map_by_window.png",
+      "title": "Detection accuracy by sliding window",
+      "kind": "trend",
+      "subtitle": "14 windows of 512 frames",
+      "summary": "intermediate_queue mAP@50 0.1857 mean, 0.1458–0.2677",
+      "metrics": [
+        "mAP50",
+        "mAP50_95"
+      ],
+      "wide": true,
+      "note": ""
+    },
+    {
+      "id": "map_summary",
+      "file": "10_map_summary.png",
+      "title": "Detection accuracy summary",
+      "kind": "comparison",
+      "subtitle": "ALL weights every scorable frame once — the headline number; WINDOW over-weights frames that sit in several windows",
+      "summary": "headline mAP@50 0.1630, mAP@50:95 0.0882",
+      "metrics": [
+        "mAP50",
+        "mAP50_95"
+      ],
+      "wide": true,
+      "note": ""
+    }
+  ],
+  "tiles": [
+    {
+      "label": "System throughput",
+      "value": "4.79",
+      "unit": "FPS",
+      "source": "fps_cluster.log",
+      "delta": "share intermediate_queue:100%",
+      "delta_kind": ""
+    },
+    {
+      "label": "Accuracy (all frames)",
+      "value": "0.1630",
+      "unit": "mAP@50",
+      "source": "map.log",
+      "delta": "mAP@50:95 0.0882",
+      "delta_kind": ""
+    },
+    {
+      "label": "System utilization",
+      "value": "61.6",
+      "unit": "%",
+      "source": "utilization_cluster.log",
+      "delta": "12 devices",
+      "delta_kind": ""
+    },
+    {
+      "label": "End-to-end latency",
+      "value": "73.8",
+      "unit": "s mean",
+      "source": "latency_cluster.log",
+      "delta": "p95 132.5s",
+      "delta_kind": ""
+    },
+    {
+      "label": "Quantization",
+      "value": "8",
+      "unit": "bit",
+      "source": "config.yaml",
+      "delta": "",
+      "delta_kind": ""
+    },
+    {
+      "label": "mAP window",
+      "value": "16",
+      "unit": "batches",
+      "source": "config.yaml",
+      "delta": "",
+      "delta_kind": ""
+    }
+  ],
+  "files": [
+    {
+      "path": "batch_done_ns.log",
+      "bytes": 12525,
+      "lines": 504,
+      "matches": 0,
+      "kind": "log"
+    },
+    {
+      "path": "config.yaml",
+      "bytes": 3215,
+      "lines": 64,
+      "matches": 20,
+      "kind": "log"
+    },
+    {
+      "path": "cut_change_ns.log",
+      "bytes": 122,
+      "lines": 2,
+      "matches": 0,
+      "kind": "log"
+    },
+    {
+      "path": "fps_cluster.log",
+      "bytes": 177,
+      "lines": 2,
+      "matches": 9,
+      "kind": "log"
+    },
+    {
+      "path": "fps_cluster_ns.log",
+      "bytes": 34896,
+      "lines": 504,
+      "matches": 948,
+      "kind": "log"
+    },
+    {
+      "path": "latency_cluster.log",
+      "bytes": 535,
+      "lines": 4,
+      "matches": 20,
+      "kind": "log"
+    },
+    {
+      "path": "map.log",
+      "bytes": 410,
+      "lines": 4,
+      "matches": 8,
+      "kind": "log"
+    },
+    {
+      "path": "map_window.log",
+      "bytes": 1534,
+      "lines": 14,
+      "matches": 56,
+      "kind": "log"
+    },
+    {
+      "path": "utilization.log",
+      "bytes": 1638,
+      "lines": 12,
+      "matches": 48,
+      "kind": "log"
+    },
+    {
+      "path": "utilization_cluster.log",
+      "bytes": 542,
+      "lines": 4,
+      "matches": 22,
+      "kind": "log"
+    }
+  ],
+  "metrics": [
+    "map50",
+    "frames",
+    "busy_s",
+    "total_s",
+    "utilization",
+    "clusters",
+    "intermediate_queue_done",
+    "window_fps",
+    "intermediate_queue_window",
+    "map50_95",
+    "edge_packages",
+    "mean_ms",
+    "p50_ms",
+    "p95_ms",
+    "max_ms",
+    "cloud_packages",
+    "packages",
+    "done",
+    "service_n",
+    "e2e_n",
+    "utilization_mean",
+    "batch_size",
+    "num_bit",
+    "num_a",
+    "num_b",
+    "num_c",
+    "num_cloud",
+    "max_clusters",
+    "network_rate_mb_s",
+    "queue_size",
+    "max_queue",
+    "window_batches",
+    "collect_timeout_s",
+    "batches_per_check",
+    "high_threshold",
+    "low_threshold",
+    "high_ratio",
+    "low_ratio",
+    "poll_interval_s",
+    "cooldown_batches",
+    "max_message_mb",
+    "intermediate_queue_fps",
+    "steady_fps",
+    "share",
+    "system_fps",
+    "intermediate_queue_window_map50_95",
+    "intermediate_queue_all_map50_95",
+    "overall_window_map50_95",
+    "overall_all_map50_95",
+    "intermediate_queue_all_devices",
+    "cloud_devices",
+    "edge_devices",
+    "system_devices"
+  ],
+  "warnings": [],
+  "pulled": {
+    "files": 10,
+    "bytes": 55594,
+    "skipped": 0,
+    "truncated": ""
+  },
+  "review": "",
+  "saved_at": ""
+}

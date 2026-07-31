@@ -1,0 +1,16 @@
+# --- Control plane (this service) ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+sqlmodel==0.0.22
+aiosqlite==0.20.0
+greenlet==3.1.1            # required by SQLAlchemy async
+asyncssh==2.19.0
+aio-pika==9.5.4
+python-multipart==0.0.20   # /control/scp file upload
+websockets==14.1
+matplotlib==3.10.0         # result charts (see guides/visual_guide.md)
+
+# --- Agents (installed ON the devices, not needed by the API) ---
+# see agent/bootstrap.sh -- torch, ultralytics, pika, numpy

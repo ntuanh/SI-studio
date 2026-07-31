@@ -1,0 +1,4 @@
+1785419703628593293 cluster=intermediate_queue_0 ALL devices=12 utilization=47.98% utilization_mean=48.00% busy_s=7394.363 total_s=15410.410 packages=1008
+1785419703628593293 cluster=intermediate_queue_0 role=cloud devices=3 utilization=44.12% busy_s=1807.466 total_s=4096.420 packages=504
+1785419703628593293 cluster=intermediate_queue_0 role=edge devices=9 utilization=49.38% busy_s=5586.897 total_s=11313.991 packages=504
+1785419703628593293 SYSTEM devices=12 clusters=1 utilization=47.98% utilization_mean=48.00% busy_s=7394.363 total_s=15410.410

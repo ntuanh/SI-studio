@@ -1,0 +1,6 @@
+1785422310404279785 cluster=intermediate_queue_0 role=cloud kind=service n=504 mean_ms=3109.911 p50_ms=3010.811 p95_ms=3637.561 max_ms=4294.924
+1785422310404279785 cluster=intermediate_queue_0 role=cloud kind=pipeline n=504 mean_ms=3109.906 p50_ms=3010.806 p95_ms=3637.557 max_ms=4294.923
+1785422310404279785 cluster=intermediate_queue_0 role=edge kind=service n=504 mean_ms=11603.677 p50_ms=10314.039 p95_ms=18194.372 max_ms=32655.914
+1785422310404279785 cluster=intermediate_queue_0 role=edge kind=pipeline n=504 mean_ms=47929.651 p50_ms=51452.746 p95_ms=73358.853 max_ms=82207.498
+1785422310404279785 cluster=intermediate_queue_0 kind=e2e n=504 mean_ms=96570.044 p50_ms=99981.157 p95_ms=127257.496 max_ms=138097.547
+1785422310404279785 SYSTEM kind=e2e n=504 mean_ms=96570.044 p50_ms=99981.157 p95_ms=127257.496 max_ms=138097.547

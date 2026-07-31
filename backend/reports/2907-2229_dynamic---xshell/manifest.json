@@ -1,0 +1,349 @@
+{
+  "id": "2907-2229_dynamic---xshell",
+  "case_name": "dynamic - xshell",
+  "created_at": "2026-07-29T22:29:44",
+  "label": "29 Jul 22:29",
+  "device_id": "__server__",
+  "device_name": "Control server",
+  "source_path": "ntuanh/Optimizer/split_inference_test/results/results_0729_2224_dynamic",
+  "charts": [
+    {
+      "id": "comparison",
+      "file": "01_comparison.png",
+      "title": "Per-file comparison",
+      "kind": "comparison",
+      "subtitle": "",
+      "summary": "1 metric(s) across 2 files",
+      "metrics": [
+        "clusters"
+      ],
+      "note": ""
+    },
+    {
+      "id": "delta",
+      "file": "02_delta.png",
+      "title": "Change by metric",
+      "kind": "delta",
+      "subtitle": "fps_cluster.log → utilization_cluster.log",
+      "summary": "utilization_cluster.log vs fps_cluster.log: none better, none worse",
+      "metrics": [
+        "clusters"
+      ],
+      "note": ""
+    },
+    {
+      "id": "trend_map50",
+      "file": "03_trend_map50.png",
+      "title": "Map50 over the run",
+      "kind": "trend",
+      "subtitle": "",
+      "summary": "28 readings across 1 file(s); mean 0.19, range 0.15–0.27",
+      "metrics": [
+        "map50"
+      ],
+      "note": ""
+    },
+    {
+      "id": "trend_frames",
+      "file": "04_trend_frames.png",
+      "title": "Frames over the run",
+      "kind": "trend",
+      "subtitle": "",
+      "summary": "28 readings across 1 file(s); mean 510, range 489–512",
+      "metrics": [
+        "frames"
+      ],
+      "note": ""
+    },
+    {
+      "id": "trend_busy_s",
+      "file": "05_trend_busy_s.png",
+      "title": "Busy s over the run",
+      "kind": "trend",
+      "subtitle": "",
+      "summary": "12 readings across 1 file(s); mean 431, range 310–585",
+      "metrics": [
+        "busy_s"
+      ],
+      "note": ""
+    },
+    {
+      "id": "trend_total_s",
+      "file": "06_trend_total_s.png",
+      "title": "Total s over the run",
+      "kind": "trend",
+      "subtitle": "",
+      "summary": "12 readings across 1 file(s); mean 613, range 571–664",
+      "metrics": [
+        "total_s"
+      ],
+      "note": ""
+    },
+    {
+      "id": "trend_utilization",
+      "file": "07_trend_utilization.png",
+      "title": "Utilization over the run",
+      "kind": "trend",
+      "subtitle": "",
+      "summary": "12 readings across 1 file(s); mean 70.6%, range 53.2–99.8%",
+      "metrics": [
+        "utilization"
+      ],
+      "note": ""
+    },
+    {
+      "id": "trend_window_fps",
+      "file": "08_trend_window_fps.png",
+      "title": "Window fps over the run",
+      "kind": "trend",
+      "subtitle": "",
+      "summary": "474 readings across 1 file(s); mean 6.92, range 0.65–11.2",
+      "metrics": [
+        "window_fps"
+      ],
+      "note": ""
+    },
+    {
+      "id": "trend_intermediate_queue_0_done",
+      "file": "09_trend_intermediate_queue_0_done.png",
+      "title": "Intermediate queue 0 done over the run",
+      "kind": "trend",
+      "subtitle": "",
+      "summary": "336 readings across 1 file(s); mean 197, range 1–395",
+      "metrics": [
+        "intermediate_queue_0_done"
+      ],
+      "note": ""
+    },
+    {
+      "id": "trend_intermediate_queue_1_done",
+      "file": "10_trend_intermediate_queue_1_done.png",
+      "title": "Intermediate queue 1 done over the run",
+      "kind": "trend",
+      "subtitle": "",
+      "summary": "168 readings across 1 file(s); mean 109, range 1–214",
+      "metrics": [
+        "intermediate_queue_1_done"
+      ],
+      "note": ""
+    }
+  ],
+  "tiles": [
+    {
+      "label": "Batch size",
+      "value": "32",
+      "unit": "",
+      "source": "config.yaml"
+    },
+    {
+      "label": "Num bit",
+      "value": "8",
+      "unit": "",
+      "source": "config.yaml"
+    },
+    {
+      "label": "Num a",
+      "value": "3",
+      "unit": "",
+      "source": "config.yaml"
+    },
+    {
+      "label": "Num b",
+      "value": "3",
+      "unit": "",
+      "source": "config.yaml"
+    },
+    {
+      "label": "Num c",
+      "value": "3",
+      "unit": "",
+      "source": "config.yaml"
+    },
+    {
+      "label": "Num cloud",
+      "value": "3",
+      "unit": "",
+      "source": "config.yaml"
+    },
+    {
+      "label": "Max clusters",
+      "value": "3",
+      "unit": "",
+      "source": "config.yaml"
+    },
+    {
+      "label": "Network rate mb s",
+      "value": "100",
+      "unit": "",
+      "source": "config.yaml"
+    },
+    {
+      "label": "Queue size",
+      "value": "4",
+      "unit": "",
+      "source": "config.yaml"
+    },
+    {
+      "label": "Max queue",
+      "value": "10",
+      "unit": "",
+      "source": "config.yaml"
+    },
+    {
+      "label": "Window batches",
+      "value": "16",
+      "unit": "",
+      "source": "config.yaml"
+    },
+    {
+      "label": "Collect timeout s",
+      "value": "30",
+      "unit": "",
+      "source": "config.yaml"
+    }
+  ],
+  "files": [
+    {
+      "path": "batch_done_ns.log",
+      "bytes": 12990,
+      "lines": 504,
+      "matches": 0,
+      "kind": "log"
+    },
+    {
+      "path": "config.yaml",
+      "bytes": 3214,
+      "lines": 64,
+      "matches": 20,
+      "kind": "log"
+    },
+    {
+      "path": "cut_change_ns.log",
+      "bytes": 61,
+      "lines": 1,
+      "matches": 0,
+      "kind": "log"
+    },
+    {
+      "path": "fps_cluster.log",
+      "bytes": 287,
+      "lines": 3,
+      "matches": 14,
+      "kind": "log"
+    },
+    {
+      "path": "fps_cluster_ns.log",
+      "bytes": 36633,
+      "lines": 504,
+      "matches": 978,
+      "kind": "log"
+    },
+    {
+      "path": "latency_cluster.log",
+      "bytes": 967,
+      "lines": 7,
+      "matches": 35,
+      "kind": "log"
+    },
+    {
+      "path": "map.log",
+      "bytes": 655,
+      "lines": 6,
+      "matches": 12,
+      "kind": "log"
+    },
+    {
+      "path": "map_window.log",
+      "bytes": 3124,
+      "lines": 28,
+      "matches": 112,
+      "kind": "log"
+    },
+    {
+      "path": "utilization.log",
+      "bytes": 1638,
+      "lines": 12,
+      "matches": 48,
+      "kind": "log"
+    },
+    {
+      "path": "utilization_cluster.log",
+      "bytes": 964,
+      "lines": 7,
+      "matches": 38,
+      "kind": "log"
+    }
+  ],
+  "metrics": [
+    "map50",
+    "frames",
+    "busy_s",
+    "total_s",
+    "utilization",
+    "clusters",
+    "window_fps",
+    "intermediate_queue_0_done",
+    "intermediate_queue_1_done",
+    "map50_95",
+    "intermediate_queue_0_window",
+    "intermediate_queue_1_window",
+    "edge_packages",
+    "mean_ms",
+    "p50_ms",
+    "p95_ms",
+    "max_ms",
+    "packages",
+    "service_n",
+    "done",
+    "e2e_n",
+    "cloud_packages",
+    "utilization_mean",
+    "steady_fps",
+    "share",
+    "cloud_devices",
+    "edge_devices",
+    "batch_size",
+    "num_bit",
+    "num_a",
+    "num_b",
+    "num_c",
+    "num_cloud",
+    "max_clusters",
+    "network_rate_mb_s",
+    "queue_size",
+    "max_queue",
+    "window_batches",
+    "collect_timeout_s",
+    "batches_per_check",
+    "high_threshold",
+    "low_threshold",
+    "high_ratio",
+    "low_ratio",
+    "poll_interval_s",
+    "cooldown_batches",
+    "max_message_mb",
+    "intermediate_queue_0_fps",
+    "intermediate_queue_1_fps",
+    "system_fps",
+    "intermediate_queue_0_window_map50_95",
+    "intermediate_queue_0_all_map50_95",
+    "intermediate_queue_1_window_map50_95",
+    "intermediate_queue_1_all_map50_95",
+    "overall_window_map50_95",
+    "overall_all_map50_95",
+    "intermediate_queue_0_all_devices",
+    "intermediate_queue_1_all_devices",
+    "system_devices"
+  ],
+  "warnings": [
+    "stopped at 10 charts; 59 metrics were found in total"
+  ],
+  "pulled": {
+    "files": 10,
+    "bytes": 60533,
+    "skipped": 0,
+    "truncated": ""
+  },
+  "review": "",
+  "saved_at": ""
+}

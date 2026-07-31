@@ -1,0 +1,56 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: split-rabbitmq
+    hostname: split-rabbitmq
+    ports:
+      - "5672:5672"    # AMQP -- the agents connect here
+      - "15672:15672"  # management UI + the HTTP API used for queue depth
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-guest}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  backend:
+    build:
+      # The parent directory, so the build can pick up the UI bundle that sits
+      # beside the backend and bake the website into the image.
+      context: ..
+      dockerfile: backend/Dockerfile
+    container_name: split-backend
+    ports:
+      - "8000:8000"
+    environment:
+      API_TOKEN: ${API_TOKEN:-dev-token-change-me}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      DATABASE_URL: sqlite+aiosqlite:////data/split_inference.db
+      BROKER_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASS:-guest}@rabbitmq:5672/
+      # The devices cannot resolve "rabbitmq" -- point them at this host's IP.
+      DEVICE_BROKER_URL: ${DEVICE_BROKER_URL:-}
+      RABBITMQ_MGMT_URL: http://rabbitmq:15672
+      RABBITMQ_MGMT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_MGMT_PASSWORD: ${RABBITMQ_PASS:-guest}
+      SECRETS_DIR: /secrets
+      SHARDS_DIR: /shards
+    volumes:
+      - backend-data:/data
+      # SSH keys + password store. Mount read-only once populated.
+      - ./secrets:/secrets
+      # head.pt / tail.pt produced by tools/split_model.py
+      - ./shards:/shards
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  rabbitmq-data:
+  backend-data:

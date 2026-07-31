@@ -1,0 +1,13 @@
+# Claude Code local permission allow-list -- machine-specific
+.claude/
+
+# Editor-local workspace file
+*.code-workspace
+
+# Defensive: the real rules live in backend/.gitignore, but a stray venv or
+# env file anywhere in the tree should never reach the remote.
+.venv/
+venv/
+.env
+__pycache__/
+*.py[cod]
