@@ -900,6 +900,11 @@
       };
       document.addEventListener('keydown', this._siVizKeys);
 
+      /* Ctrl/Cmd+Enter to run the typed command -- `siRunKey` decides whether
+       * the keystroke belongs to the command box, and what it refuses. */
+      this._siRunKeys = function (e) { self.siRunKey(e); };
+      document.addEventListener('keydown', this._siRunKeys);
+
       this._siFx = installPointerFx();
 
       this.setState({ liveMode: SI.isLive() });
@@ -945,6 +950,10 @@
       if (this._siVizKeys) {
         document.removeEventListener('keydown', this._siVizKeys);
         this._siVizKeys = null;
+      }
+      if (this._siRunKeys) {
+        document.removeEventListener('keydown', this._siRunKeys);
+        this._siRunKeys = null;
       }
       if (this._siFx) { this._siFx(); this._siFx = null; }
       this.vizDropImages();
@@ -1861,6 +1870,40 @@
           return null;
         })
         .then(function () { self.sshPatch({ busy: false }); });
+    },
+
+    /* Ctrl/Cmd+Enter in the command box presses ▶ Run.
+     *
+     * The box is a single-line input, so Enter is unused there, and the loop
+     * it shortens is the one that actually happens: type, run, read the
+     * console, edit, run again. Reaching for the button between every attempt
+     * is the only reason the hand leaves the keyboard.
+     *
+     * The box is identified by what it holds rather than by its placeholder
+     * text or its position: the Control tab is full of other inputs (the
+     * server login, the scp paths, the directory row) and the one bound to
+     * `ssh.command` is the one whose value *is* the command. Display text can
+     * be reworded by a re-export of the bundle; this binding cannot, because
+     * everything else here already depends on it.
+     *
+     * Guarded exactly like the button (`runDisabled`) -- no targets, or a call
+     * already in flight, and the keystroke does nothing rather than starting a
+     * second run the button would have refused. Returns whether it fired, so
+     * each guard is drivable from a test. */
+    siRunKey: function (e) {
+      if ((e.key || '') !== 'Enter') return false;
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return false;
+
+      var ssh = this.state.ssh || {};
+      var cmd = ssh.command || '';
+      if (!cmd.trim() || !(ssh.selected || []).length || ssh.busy) return false;
+
+      var target = e.target || {};
+      if (target.tagName !== 'INPUT' || (target.value || '') !== cmd) return false;
+
+      if (e.preventDefault) e.preventDefault();
+      this.sshRun();
+      return true;
     },
 
     sshScp: function () {

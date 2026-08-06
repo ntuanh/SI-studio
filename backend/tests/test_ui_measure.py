@@ -5,11 +5,12 @@ is also the part that rots silently -- a renamed response field would show up as
 a device card that quietly stops updating, with nothing in any log. These tests
 load it with the page's globals stubbed and call the handlers directly.
 
-Two groups. The **Measure** button, from the click through `/devices/measure` to
-the numbers on the cards. And the **✕ buttons** -- remove a stage, remove a
+Three groups. The **Measure** button, from the click through `/devices/measure`
+to the numbers on the cards. The **✕ buttons** -- remove a stage, remove a
 device, delete a saved report -- where the thing worth pinning is that they ask
 first and that a cancelled prompt changes nothing, because none of what they
-destroy is recoverable from the UI.
+destroy is recoverable from the UI. And **Ctrl/Cmd+Enter**, which presses ▶ Run
+without the mouse and so has to refuse everything the button refuses.
 """
 
 from __future__ import annotations
@@ -184,6 +185,28 @@ function clickMeasure(stage, response, opts) {
       measuring: Object.keys(self.state.siMeasuring || {})
     });
   };
+}
+
+/* Ctrl/Cmd+Enter in the command box. `RAN` says whether the keystroke reached
+   `sshRun`, and `PREVENTED` whether it took the browser's own handling away
+   from a keystroke that then did nothing. The event defaults to the real one --
+   Ctrl+Enter, from an input holding exactly what the box holds -- so each test
+   overrides only the part it is about. */
+var RAN = 0;
+var PREVENTED = 0;
+function runKey(ssh, event) {
+  RAN = 0; PREVENTED = 0;
+  var self = Object.assign(Object.create(Component.prototype), {
+    state: { ssh: ssh },
+    sshRun: function () { RAN++; }
+  });
+  var e = Object.assign({
+    key: 'Enter', ctrlKey: true,
+    target: { tagName: 'INPUT', value: ssh.command }
+  }, event || {});
+  e.preventDefault = function () { PREVENTED++; };
+  var fired = Component.prototype.siRunKey.call(self, e);
+  return JSON.stringify({ fired: fired, ran: RAN, prevented: PREVENTED });
 }
 """
 
@@ -876,3 +899,61 @@ def test_a_result_for_a_device_no_stage_claims_is_dropped(js):
     out = fleet(js, response)
     assert "ghost" not in {p["id"] for p in out["calls"]["patches"]}
     assert set(out["notices"]) == {"s1", "s2"}
+
+
+# ------------------------------------------------- Ctrl/Cmd+Enter for ▶ Run
+#: The state the button is enabled in: something typed, something ticked,
+#: nothing in flight.
+READY = {"command": "nvidia-smi", "selected": ["dA"], "busy": False}
+
+
+def press(js, event: dict | None = None, **ssh) -> dict:
+    """One keystroke at the command box, with `ssh` state overrides applied."""
+    state = {**READY, **ssh}
+    return json.loads(
+        js.eval(f"runKey({json.dumps(state)}, {json.dumps(event or {})})")
+    )
+
+
+def test_ctrl_enter_in_the_command_box_runs_it(js):
+    out = press(js)
+    assert out["ran"] == 1
+    assert out["prevented"] == 1, "the keystroke was left to the browser as well"
+
+
+def test_cmd_enter_does_the_same_on_a_mac(js):
+    assert press(js, {"ctrlKey": False, "metaKey": True})["ran"] == 1
+
+
+def test_enter_on_its_own_is_not_the_shortcut(js):
+    """A one-line input swallows Enter; running on it would make every typo a
+    fan-out to the whole selection."""
+    out = press(js, {"ctrlKey": False})
+    assert out["ran"] == 0
+    assert out["prevented"] == 0
+
+
+def test_another_field_on_the_tab_keeps_its_keystroke(js):
+    """The Control tab is full of inputs -- the scp path, the server login --
+    and none of them mean "run the command"."""
+    other = {"target": {"tagName": "INPUT", "value": "/home/dai/results"}}
+    assert press(js, other)["ran"] == 0
+    # The preset editor is a textarea holding the whole list, not one command.
+    editor = {"target": {"tagName": "TEXTAREA", "value": "gpu = nvidia-smi"}}
+    assert press(js, editor)["ran"] == 0
+
+
+def test_the_shortcut_refuses_whatever_the_button_refuses(js):
+    """`runDisabled` on the button is no targets or a call already in flight;
+    a keystroke that ignored it would start a second run."""
+    assert press(js, selected=[])["ran"] == 0
+    assert press(js, busy=True)["ran"] == 0
+    # An empty box with a stale selection is the same click that does nothing.
+    assert press(js, {"target": {"tagName": "INPUT", "value": "   "}},
+                 command="   ")["ran"] == 0
+
+
+def test_a_modified_ctrl_enter_is_left_alone(js):
+    """Ctrl+Shift+Enter and Ctrl+Alt+Enter belong to whoever bound them."""
+    assert press(js, {"shiftKey": True})["ran"] == 0
+    assert press(js, {"altKey": True})["ran"] == 0

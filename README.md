@@ -91,7 +91,9 @@ like a device. The ⚙ on a row opens that device's login form, with **copy logi
 
 **Run command on N device(s)** — the chips are your saved commands (**edit**
 changes the list), the **directory** row is where they run, and the `$` box is
-free-form. `cd` on its own cannot stick, because every command gets a fresh
+free-form. **Ctrl+Enter** (⌘+Enter on a Mac) in that box is **▶ Run**, so a
+command you are still getting right does not send you back to the mouse between
+attempts. `cd` on its own cannot stick, because every command gets a fresh
 shell — that is what the directory row is for.
 
 | If you want to | Do this |
