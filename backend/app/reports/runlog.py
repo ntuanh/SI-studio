@@ -37,6 +37,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .window import Window
+
 log = logging.getLogger(__name__)
 
 #: The nine files of `server_results_guide.md` §2, plus the archived config.
@@ -137,6 +139,11 @@ class RunData:
     cuts: list[dict[str, object]] = field(default_factory=list)
     #: config.yaml — the settings that produced these numbers
     config: dict[str, float] = field(default_factory=dict)
+
+    #: The slice of the run the series above were cut to. The summary fields
+    #: (`throughput`, `utilization`, `latency`, `accuracy`) are untouched by
+    #: it — see `window.py` for why they cannot be.
+    window: Window = field(default_factory=Window)
 
     warnings: list[str] = field(default_factory=list)
 
@@ -388,7 +395,42 @@ def tag_of(root: Path) -> str:
     return tail if tail in ("dynamic", "split", "only_cloud", "only_edge") else ""
 
 
-def read_run(root: Path) -> RunData:
+def apply_window(data: RunData, window: Window) -> RunData:
+    """Cut every per-batch series down to `window`, in place.
+
+    Each series is sliced on its own length rather than on a shared clock: they
+    are all one-reading-per-batch, so the same percentage lands at the same
+    point in the run for each of them, and a cluster that produced fewer
+    batches is still cut at *its* 5% mark rather than at another cluster's.
+
+    `cuts` is the exception, because a split-point change is an event at an
+    arbitrary moment rather than a reading. Those are cut on the clock, to the
+    span the kept readings actually cover — a marker for a change that happened
+    outside the window would be drawn at the edge of the axes and read as
+    having happened inside it.
+    """
+    data.window = window
+    if window.whole:
+        return data
+
+    data.system_fps = window.clip(data.system_fps)
+    data.cluster_fps = {c: window.clip(points) for c, points in data.cluster_fps.items()}
+    data.accuracy_window = {
+        c: window.clip(rows) for c, rows in data.accuracy_window.items()
+    }
+
+    kept = [p for points in (data.system_fps, *data.cluster_fps.values()) for p in points]
+    if kept and data.cuts:
+        first, last = min(p.at for p in kept), max(p.at for p in kept)
+        data.cuts = [
+            cut for cut in data.cuts
+            if math.isfinite(float(cut.get("at", math.nan)))
+            and first <= float(cut["at"]) <= last
+        ]
+    return data
+
+
+def read_run(root: Path, window: Window | None = None) -> RunData:
     """Read every file the run wrote. One bad file never sinks the report."""
     data = RunData(tag=tag_of(root))
     data.files = sorted(p.name for p in root.iterdir() if p.is_file())
@@ -410,4 +452,7 @@ def read_run(root: Path) -> RunData:
         missing = [m for m in missing if m != "cut_change_ns.log"]
     if missing:
         data.warnings.append("not written by this run: " + ", ".join(missing))
-    return data
+
+    # Last, so the window cuts the finished series rather than racing the
+    # readers that are still appending to them.
+    return apply_window(data, window or Window())

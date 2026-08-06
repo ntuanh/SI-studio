@@ -205,7 +205,7 @@ LOG_A = "\n".join(f"edge_ms={12 + (i % 5) * 0.4:.2f}" for i in range(40)) + "\nP
 LOG_B = "\n".join(f"cloud_ms={4 + (i % 3) * 0.5:.2f}" for i in range(40)) + "\nPeak memory 2210 MB\n"
 
 
-def analyze(configured, auth, case="cut6-8bit"):
+def analyze(configured, auth, case="cut6-8bit", **extra):
     with patch("app.ssh.pool.pool.get", new=AsyncMock()), patch(
         "app.ssh.commands.sftp_get_dir",
         new=AsyncMock(side_effect=fake_pull({"a.log": LOG_A, "b.log": LOG_B})),
@@ -213,7 +213,7 @@ def analyze(configured, auth, case="cut6-8bit"):
         return configured.post(
             "/reports/analyze",
             json={"device_id": gateway.SERVER_DEVICE_ID, "path": "/home/dai/run7",
-                  "case_name": case},
+                  "case_name": case, **extra},
             headers=auth,
         )
 
@@ -412,6 +412,55 @@ def test_views_reject_a_bad_report_id(configured, auth) -> None:
     # normalisation, so this is the case the id guard actually sees.
     assert configured.put("/reports/%2E%2E/views", json={"views": {}},
                           headers=auth).status_code == 400
+
+
+def test_analyze_records_the_window_it_charted(configured, auth) -> None:
+    """A report says which slice of the run it is, or it is not reproducible."""
+    whole = analyze(configured, auth, case="all").json()
+    part = analyze(configured, auth, case="mid",
+                   window_start=5, window_end=90).json()
+
+    assert whole["window"] == {}
+    assert part["window"] == {"start": 5.0, "end": 90.0, "label": "5–90%"}
+    # 40 readings per log, so 5–90% is readings 2 through 36 of each.
+    assert "35 readings" in next(c for c in part["charts"] if c["kind"] == "trend")["summary"]
+    assert "40 readings" in next(c for c in whole["charts"] if c["kind"] == "trend")["summary"]
+
+
+def test_the_window_survives_a_redraw(configured, auth) -> None:
+    """Renaming an axis must not quietly widen the report to the whole run."""
+    body = analyze(configured, auth, window_start=5, window_end=90).json()
+    chart = next(c for c in body["charts"] if c["kind"] == "trend")
+
+    redrawn = configured.put(
+        f"/reports/{body['id']}/views",
+        json={"views": {chart["id"]: {"title": "Renamed"}}}, headers=auth,
+    ).json()
+
+    assert redrawn["window"] == body["window"]
+    again = next(c for c in redrawn["charts"] if c["id"] == chart["id"])
+    assert again["title"] == "Renamed"
+    assert again["summary"] == chart["summary"]        # the same 35 readings
+
+
+def test_the_window_shows_up_in_the_history_row(configured, auth) -> None:
+    body = analyze(configured, auth, case="mid", window_start=5, window_end=90).json()
+    whole = analyze(configured, auth, case="all").json()
+    rows = {r["id"]: r for r in configured.get("/reports", headers=auth).json()["reports"]}
+
+    assert rows[body["id"]]["window"] == "5–90%"
+    assert rows[whole["id"]]["window"] == ""
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    [(90, 5), (50, 50), (-1, 90), (5, 101)],
+    ids=["inverted", "empty", "below-zero", "over-a-hundred"],
+)
+def test_a_window_that_is_not_a_slice_of_a_run_is_refused(configured, auth, bounds) -> None:
+    """Widening it to the whole run instead would answer a different question."""
+    r = analyze(configured, auth, window_start=bounds[0], window_end=bounds[1])
+    assert r.status_code == 422
 
 
 def test_analyze_rejects_a_directory_with_nothing_readable(configured, auth) -> None:

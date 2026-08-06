@@ -45,7 +45,10 @@ router = APIRouter(prefix="/reports", tags=["reports"], dependencies=[Depends(re
 
 
 def _analyse(
-    pulled_root: Path, out_dir: Path, views: dict[str, chartmod.View] | None = None
+    pulled_root: Path,
+    out_dir: Path,
+    views: dict[str, chartmod.View] | None = None,
+    window: chartmod.Window | None = None,
 ) -> tuple[Any, list[Any], list[Any], list[str]]:
     """Parse + render. Runs in a worker thread: matplotlib is CPU-bound and
     would otherwise stall every other request on the event loop."""
@@ -54,7 +57,7 @@ def _analyse(
     # directories and draw the guide's catalogue against its real schema,
     # instead of the file-by-file view the schema-blind parser can offer.
     drawn, tiles, notes = chartmod.render(
-        parsed, out_dir, source_dir=pulled_root, views=views
+        parsed, out_dir, source_dir=pulled_root, views=views, window=window
     )
     return parsed, drawn, tiles, notes
 
@@ -66,6 +69,7 @@ async def analyze(
     """Pull `path` off a device, chart what it measured, save it as a report."""
     target = _check_remote_path(payload.path)
     device = (await _resolve_devices(session, [payload.device_id]))[0]
+    window = chartmod.Window.of(payload.window_start, payload.window_end)
 
     when = datetime.now()
     report_id = store.report_id(payload.case_name, when)
@@ -106,8 +110,11 @@ async def analyze(
             f"{pulled['bytes'] / 1e6:.1f} MB — charting",
             "stdout",
         )
+        # The whole directory is pulled and kept whatever the window is: the
+        # window says which readings to *chart*, and throwing the rest away
+        # would make widening it later mean another trip over SSH.
         parsed, drawn, tiles, notes = await asyncio.to_thread(
-            _analyse, staging, directory / store.IMG_DIR
+            _analyse, staging, directory / store.IMG_DIR, None, window
         )
         # Kept *after* a successful render, so a failed analysis leaves no
         # half-report behind, and before the staging dir goes.
@@ -142,6 +149,7 @@ async def analyze(
         ],
         metrics=[m.name for m in parsed.ranked()],
         warnings=warnings,
+        window={} if window.whole else window.to_dict(),
         pulled={
             "files": len(pulled["files"]), "bytes": pulled["bytes"],
             "skipped": len(pulled["skipped"]), "truncated": pulled["truncated"],
@@ -225,8 +233,12 @@ async def save_views(report_id: str, payload: ViewsIn) -> dict[str, Any]:
         chart_id: chartmod.View.from_dict(view.model_dump())
         for chart_id, view in payload.views.items()
     }
+    # The window came from the report, not from this request. It is a property
+    # of the analysis rather than of the wording, so renaming an axis must not
+    # quietly widen the charts back out to the whole run.
     parsed, drawn, tiles, notes = await asyncio.to_thread(
-        _analyse, logs, store.report_dir(report_id) / store.IMG_DIR, views
+        _analyse, logs, store.report_dir(report_id) / store.IMG_DIR, views,
+        chartmod.Window.from_dict(report.window),
     )
 
     report.charts = store.carry_over(report, [c.to_dict() for c in drawn])

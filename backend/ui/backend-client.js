@@ -196,10 +196,19 @@
     /* Pull a finished run's result directory and chart it. Synchronous by
      * design -- it takes seconds, and a progress protocol for that is just a
      * second way for the UI and the server to disagree. */
-    analyzeResults: function (deviceId, path, caseName) {
-      return request('POST', '/reports/analyze', {
+    /* `window` is the optional static slice to analyse, `{start, end}` in
+     * percent of the run's readings -- `{start: 5, end: 90}` charts batches 5
+     * to 90 of a hundred. Omitted, the whole run is charted, which is what
+     * every call did before the argument existed. */
+    analyzeResults: function (deviceId, path, caseName, window) {
+      var body = {
         device_id: deviceId, path: path, case_name: caseName || ''
-      });
+      };
+      if (window) {
+        body.window_start = window.start;
+        body.window_end = window.end;
+      }
+      return request('POST', '/reports/analyze', body);
     },
     listReports: function (limit) { return request('GET', '/reports?limit=' + (limit || 50)); },
     getReport: function (id) { return request('GET', '/reports/' + encodeURIComponent(id)); },

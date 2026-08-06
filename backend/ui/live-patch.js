@@ -187,7 +187,14 @@
         // them here would fight with whatever the server holds.
         viz: {
           dir: (state.viz || {}).dir || '',
-          caseName: (state.viz || {}).caseName || ''
+          caseName: (state.viz || {}).caseName || '',
+          // The window is an input like the other two: an operator trimming
+          // warm-up off one run is about to do it to the next one as well.
+          // Left uncoerced -- `undefined` drops out of the JSON and comes back
+          // as the default, where `''` is a box that was deliberately cleared.
+          windowOn: !!(state.viz || {}).windowOn,
+          windowStart: (state.viz || {}).windowStart,
+          windowEnd: (state.viz || {}).windowEnd
         },
         ssh: {
           conn: conn,
@@ -228,6 +235,56 @@
    * could land on the wrong chip. */
   function vizDay(report) {
     return (report && report.created_at || '').slice(0, 10);
+  }
+
+  /* ---- the analysis window: chart part of a run instead of all of it ------
+   *
+   * The first batches of a run are warm-up and the last are the tail draining,
+   * and both drag every mean and every axis around. The window is the operator
+   * saying "batches 5 to 90 of a hundred" once, before analysing, so the whole
+   * report is drawn from the same stretch.
+   *
+   * Static by design (see app/reports/window.py): the bounds are typed, stored
+   * with the report, and re-used verbatim whenever its charts are re-drawn. */
+  var VIZ_WINDOW_DEFAULT = { windowStart: '5', windowEnd: '90' };
+
+  /* What a window box currently holds. `undefined` is a box nobody has touched
+   * and takes the default; `''` is one that was deliberately cleared and stays
+   * empty, so the field does not refill itself under the cursor. */
+  function vizWindowText(viz, key) {
+    var value = (viz || {})[key];
+    return value == null ? VIZ_WINDOW_DEFAULT[key] : String(value);
+  }
+
+  /* `null` when the window is off, `{start, end}` when it is usable, and
+   * `{error}` when the two boxes do not describe a slice of a run.
+   *
+   * Validated here as well as on the backend because the backend's answer is a
+   * 422 after an SSH pull that need never have happened -- and because the
+   * message can name what was typed. */
+  function vizWindowOf(viz) {
+    if (!viz || !viz.windowOn) return null;
+    var start = parseFloat(vizWindowText(viz, 'windowStart'));
+    var end = parseFloat(vizWindowText(viz, 'windowEnd'));
+    if (isNaN(start) || isNaN(end)) {
+      return { error: 'the window needs two numbers — 5 and 90 charts batches 5 to 90 of 100' };
+    }
+    if (start < 0 || end > 100) {
+      return { error: 'the window is a percentage of the run, so both ends sit in 0–100' };
+    }
+    if (start >= end) {
+      return { error: 'the window runs from ' + fmtPct(start) + '% to ' + fmtPct(end) +
+        '% — the start has to come first' };
+    }
+    return { start: start, end: end };
+  }
+
+  function fmtPct(n) {
+    return String(Math.round(n * 100) / 100);
+  }
+
+  function vizWindowLabel(w) {
+    return w && !w.error ? fmtPct(w.start) + '–' + fmtPct(w.end) + '%' : '';
   }
 
   function fmtBytes(n) {
@@ -764,7 +821,7 @@
         };
         if (saved.uploadedModel) patch.uploadedModel = saved.uploadedModel;
         patch.viz = Object.assign(
-          { dir: '', caseName: '' }, saved.viz || {}
+          { dir: '', caseName: '', windowOn: false }, saved.viz || {}
         );
         this.setState(patch);
       }
@@ -2067,19 +2124,30 @@
           statusKind: 'err' });
         return;
       }
-      this.vizDropImages();
-      this.vizPatch({ busy: true, status: 'pulling and charting ' + dir + '…',
-        statusKind: 'info', srcs: {}, report: null, browseEntries: [] });
-      this.sshLog([{ text: '▦ analysing ' + dir + ' …', color: C.info }], id);
+      // A window that does not describe a slice of a run is caught before the
+      // pull: the SSH round trip is the slow part, and it would only end in a
+      // 422 about the same two numbers.
+      var window_ = vizWindowOf(viz);
+      if (window_ && window_.error) {
+        this.vizPatch({ status: window_.error, statusKind: 'err' });
+        return;
+      }
+      var scope = window_ ? ' (' + vizWindowLabel(window_) + ' of it)' : '';
 
-      return SI.api.analyzeResults(id, dir, viz.caseName || '')
+      this.vizDropImages();
+      this.vizPatch({ busy: true, status: 'pulling and charting ' + dir + scope + '…',
+        statusKind: 'info', srcs: {}, report: null, browseEntries: [] });
+      this.sshLog([{ text: '▦ analysing ' + dir + scope + ' …', color: C.info }], id);
+
+      return SI.api.analyzeResults(id, dir, viz.caseName || '', window_)
         .then(function (report) {
           var notes = {};
           (report.charts || []).forEach(function (c) { notes[c.id] = c.note || ''; });
           self.vizPatch({
             busy: false, report: report, notes: notes, review: report.review || '',
             status: report.charts.length
-              ? report.charts.length + ' chart(s) from ' + report.files.length + ' file(s)'
+              ? report.charts.length + ' chart(s) from ' + report.files.length +
+                ' file(s)' + (scope ? ' — ' + vizWindowLabel(window_) + ' window' : '')
               : 'no charts: ' + ((report.warnings || [])[0] || 'nothing chartable'),
             statusKind: report.charts.length ? 'ok' : 'warn'
           });
@@ -2125,11 +2193,20 @@
         .then(function (report) {
           var notes = {};
           (report.charts || []).forEach(function (c) { notes[c.id] = c.note || ''; });
+          // The boxes are put back the way this report was made, window and
+          // all -- so "re-run this with one more chart" is Analyze, not a hunt
+          // through the manifest for which slice it was.
+          var slice = report.window || {};
           self.vizPatch({
             busy: false, report: report, notes: notes,
             review: report.review || '', dir: report.source_path || '',
             caseName: report.case_name || '',
-            status: report.label + ' · ' + report.case_name, statusKind: 'ok'
+            windowOn: slice.label != null && slice.start != null,
+            windowStart: slice.start != null ? String(slice.start) : undefined,
+            windowEnd: slice.end != null ? String(slice.end) : undefined,
+            status: report.label + ' · ' + report.case_name +
+              (slice.label ? ' · ' + slice.label : ''),
+            statusKind: 'ok'
           });
           return self.vizLoadImages(report);
         })
@@ -2710,7 +2787,9 @@
           ? (vizReport.case_name || vizReport.id)
           : (vizSaved.length ? vizSaved.length + ' saved report(s)' : 'no report open'),
         headlineSub: vizReport
-          ? vizReport.label + ' · ' + vizCharts.length + ' chart(s)'
+          ? vizReport.label + ' · ' + vizCharts.length + ' chart(s)' +
+            (((vizReport.window || {}).label)
+              ? ' · ' + vizReport.window.label + ' of the run' : '')
           : 'pick a directory below, or a run from history',
         headlineStyle: {
           textAlign: 'right', minWidth: 0, maxWidth: '260px',
@@ -2753,6 +2832,48 @@
 
         caseName: viz.caseName || '',
         onCaseName: function (e) { self.vizPatch({ caseName: e.target.value }); },
+
+        // The window row: off by default, because the whole run is what a
+        // report has always meant and a slice has to be asked for.
+        windowOn: !!viz.windowOn,
+        onWindowToggle: function () {
+          self.vizPatch({ windowOn: !(self.state.viz || {}).windowOn });
+        },
+        windowToggleLabel: viz.windowOn ? '⧗ Window' : '⧗ Whole run',
+        windowToggleTitle: viz.windowOn
+          ? 'Analysing part of the run — click to go back to all of it'
+          : 'Analysing the whole run — click to chart only part of it',
+        windowToggleStyle: {
+          background: viz.windowOn ? 'var(--server)' : 'var(--bg)',
+          color: viz.windowOn ? '#fff' : 'var(--muted)',
+          border: '1px solid ' + (viz.windowOn ? 'var(--server)' : 'var(--border)'),
+          borderRadius: '9px', padding: '9px 12px', fontSize: '12px',
+          fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap'
+        },
+        windowRowStyle: viz.windowOn ? '' : 'display:none;',
+        windowStart: vizWindowText(viz, 'windowStart'),
+        windowEnd: vizWindowText(viz, 'windowEnd'),
+        onWindowStart: function (e) { self.vizPatch({ windowStart: e.target.value }); },
+        onWindowEnd: function (e) { self.vizPatch({ windowEnd: e.target.value }); },
+        // Says what the two numbers will do to *this* run rather than in
+        // general, and says the limit out loud: the summary files hold one
+        // whole-run line each, and no window can re-cut those.
+        windowHint: (function () {
+          var w = vizWindowOf(viz);
+          if (!w) return '';
+          if (w.error) return '✗ ' + w.error;
+          return vizWindowLabel(w) + ' of the run — batches ' + Math.ceil(w.start) +
+            ' to ' + Math.floor(w.end) + ' of 100, on every per-batch chart. ' +
+            'The throughput, latency, utilization and accuracy summaries are ' +
+            'whole-run figures and stay that way.';
+        })(),
+        windowHintStyle: (function () {
+          var w = vizWindowOf(viz);
+          if (!w) return 'display:none;';
+          return 'font-size:10px; line-height:1.5; color:' +
+            (w.error ? 'var(--alert)' : 'var(--muted)') + ';';
+        })(),
+
         busy: !!viz.busy,
         onAnalyze: function () { self.vizAnalyze(); },
         analyzeLabel: viz.busy ? '… working' : '▦ Analyze',
@@ -2979,14 +3100,19 @@
           return {
             // The note pip is the point of keeping history: it says at a
             // glance which past runs were actually reviewed.
+            // …and the window marker says which pills are a slice of a run
+            // rather than all of it. Two analyses of one directory that differ
+            // only by their window are otherwise the same pill twice.
             label: (cmpOn && slot >= 0 ? VIZ_SLOT_MARK[slot] + ' ' : '') +
-              s.time_label + '  ' + s.case_name + (s.reviewed ? '  ✎' : ''),
+              s.time_label + '  ' + s.case_name +
+              (s.window ? '  ⧗' + s.window : '') + (s.reviewed ? '  ✎' : ''),
             title: (cmpOn
                     ? (slot >= 0 ? 'Slot ' + (slot + 1) + ' — click to unpin\n'
                                  : 'Click to pin beside the others\n')
                     : '') +
               s.id + ' — ' + s.charts + ' chart(s)' +
               (s.notes ? ', ' + s.notes + ' note(s)' : ', no notes') +
+              (s.window ? '\nanalysed over ' + s.window + ' of the run' : '') +
               (s.device_name ? '\n' + s.device_name : '') +
               (s.source_path ? '\n' + s.source_path : ''),
             onOpen: cmpOn

@@ -397,6 +397,10 @@ VISUAL_CSS = """
     padding:14px 15px;
   }
   .viz-row { display:grid; grid-template-columns:auto 1fr auto; gap:9px; align-items:center; }
+  /* The window row's controls travel together and wrap as a unit: "5 to 90 %
+     of the run" split across two lines reads as two settings. */
+  .viz-window { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .viz-window-to { font-size:11px; color:var(--muted); white-space:nowrap; }
   .viz-tiles {
     display:grid; gap:10px;
     grid-template-columns:repeat(auto-fit, minmax(155px, 1fr));
@@ -691,6 +695,22 @@ VISUAL_SECTION = """
                   </div>
                 </sc-for>
               </div>
+              <!-- how much of the run to chart. The toggle is always here, so
+                   a report's scope is a thing you can see before analysing;
+                   the two boxes appear only once a slice has been asked for. -->
+              <div class="viz-row">
+                <span style="__CAPTION__">Window</span>
+                <span class="viz-window">
+                  <button sc-camel-on-click="{{ viz.onWindowToggle }}" title="{{ viz.windowToggleTitle }}" style="{{ viz.windowToggleStyle }}">{{ viz.windowToggleLabel }}</button>
+                  <span class="viz-window" style="{{ viz.windowRowStyle }}">
+                    <input value="{{ viz.windowStart }}" sc-camel-on-change="{{ viz.onWindowStart }}" placeholder="5" title="Where the window starts, as a percent of the run" style="__INPUT__ width:66px; text-align:right;">
+                    <span class="viz-window-to">to</span>
+                    <input value="{{ viz.windowEnd }}" sc-camel-on-change="{{ viz.onWindowEnd }}" placeholder="90" title="Where the window ends, as a percent of the run" style="__INPUT__ width:66px; text-align:right;">
+                    <span class="viz-window-to">% of the run</span>
+                  </span>
+                </span>
+              </div>
+              <div style="{{ viz.windowHintStyle }}">{{ viz.windowHint }}</div>
               <div class="viz-row">
                 <span style="__CAPTION__">Case test</span>
                 <input value="{{ viz.caseName }}" sc-camel-on-change="{{ viz.onCaseName }}" placeholder="what is this run? e.g. cut6-8bit" style="__INPUT__">

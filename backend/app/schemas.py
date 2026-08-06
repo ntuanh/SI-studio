@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 DeviceKind = Literal["Edge", "Fog", "Cloud", "Custom"]
 AuthMethod = Literal["key", "password"]
@@ -247,6 +247,28 @@ class AnalyzeRequest(_Base):
     #: Names the report alongside the timestamp, so a saved folder reads as
     #: `2807-1432_cut6-8bit` rather than a bare date.
     case_name: str = ""
+    #: The static slice of the run to analyse, as percentages of its readings:
+    #: `5`–`90` keeps batches 5 through 90 of a hundred. `0`–`100` is the whole
+    #: run, which is what every report was before this existed. See
+    #: `reports/window.py` for what a window can and cannot narrow.
+    window_start: float = 0.0
+    window_end: float = 100.0
+
+    @field_validator("window_start", "window_end")
+    @classmethod
+    def _a_percentage(cls, value: float) -> float:
+        if not 0.0 <= value <= 100.0:
+            raise ValueError("window bounds are percentages, so 0–100")
+        return value
+
+    @model_validator(mode="after")
+    def _forward(self) -> "AnalyzeRequest":
+        # An inverted or empty window is rejected rather than silently widened:
+        # it is a typo in the box, and analysing the whole run instead would
+        # answer a question nobody asked.
+        if self.window_start >= self.window_end:
+            raise ValueError("the window's start must come before its end")
+        return self
 
 
 class NotesIn(_Base):

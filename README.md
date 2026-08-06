@@ -130,6 +130,30 @@ headline tiles](docs/img/ui-visual.png)
 The tiles across the top are the numbers that *are* the story. Everything below
 them is the gallery, one card per chart.
 
+### Charting part of a run
+
+The first batches of a run are warm-up and the last are the tail draining. Both
+drag the averages around and put a ramp on either end of every timeline, which
+is the shape of the harness rather than of the split.
+
+**⧗ Whole run** is the button that changes that. Click it and two boxes appear:
+type `5` and `90` and the report is drawn from **batches 5 to 90 of a hundred**
+— the same fixed slice on every chart. The bounds are percentages of the run, so
+they mean the same thing whether it did 100 batches or 10,000.
+
+The window is *static*: you set it before analysing, it is stored with the
+report, and re-drawing a chart later uses it again. Two analyses of one
+directory with different windows are two reports, and History marks the
+narrowed ones with `⧗5–90%`.
+
+One thing it cannot do, and every chart says which side it is on: `fps_cluster.log`,
+`latency_cluster.log`, `utilization*.log` and `map.log` each hold a single line
+that the *run itself* computed over its whole duration. Throughput, latency,
+utilization, accuracy totals and the tiles above the gallery are those numbers,
+so they keep saying **whole run** even in a windowed report. The window narrows
+what was measured batch by batch — the FPS timelines, the FPS spread, and mAP by
+window.
+
 ### A chart card
 
 ![One chart card with its settings panel open: series pills, title and axis

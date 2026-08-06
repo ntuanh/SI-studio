@@ -36,15 +36,18 @@ import numpy as np
 from . import palette as pal
 from . import runcharts, runlog
 from .parse import Metric, ParseResult
+from .parse import apply_window as clip_parsed
 from .style import (
     AXIS, BAD, GOOD, INK, INK_2, LINE_KW, MARK_KW, MUTED, S1, SURFACE, STYLE,
     TINT, BAR_KW, Canvas, Chart, Shown, Tile, View, applied, entity_colors, fmt,
     headroom, label_bars, rolling_mean, smooth_window, suptitle, tidy,
 )
+from .window import Window
 
 log = logging.getLogger(__name__)
 
-__all__ = ["Chart", "Tile", "View", "render", "STYLE", "BAR_KW", "LINE_KW", "MARK_KW"]
+__all__ = ["Chart", "Tile", "View", "Window", "render", "STYLE", "BAR_KW",
+           "LINE_KW", "MARK_KW"]
 
 #: A metric needs this many readings before a trend line says anything.
 TREND_MIN = 8
@@ -585,6 +588,7 @@ def render(
     source_dir: Path | None = None,
     max_charts: int = 10,
     views: dict[str, View] | None = None,
+    window: Window | None = None,
 ) -> tuple[list[Chart], list[Tile], list[str]]:
     """Pick the forms, draw them, and return (charts, tiles, notes).
 
@@ -596,6 +600,12 @@ def render(
     chart id. Applying them means drawing the whole report again rather than
     editing a PNG, which is the point: the saved image *is* the edited chart.
 
+    `window` narrows the run to a fixed a%–b% slice of its readings before any
+    of that happens, so every chart in the report is drawn from the same
+    stretch. It is applied to the *data*, never to a finished figure — a
+    windowed chart's axes, mean line and endpoint label all describe the
+    window, which is the only reading of them that is true.
+
     Form comes from the data's job, per the guide's §0: many readings over a
     run is change-over-time, one reading per file is a comparison, and a single
     number is a stat tile rather than a one-bar bar chart.
@@ -605,12 +615,13 @@ def render(
     tiles: list[Tile] = []
     notes: list[str] = []
     stored = views or {}
+    slice_ = window or Window()
 
     known = source_dir is not None and runlog.detect(source_dir)
     with plt.rc_context(STYLE):
         if known:
             assert source_dir is not None
-            data = runlog.read_run(source_dir)
+            data = runlog.read_run(source_dir, slice_)
             notes = runcharts.render(data, canvas, stored)
             tiles = runcharts.tiles(data)
             if not canvas.charts:
@@ -620,8 +631,14 @@ def render(
                 )
                 known = False
         if not known:
-            tiles, generic_notes = _generic(result, canvas, max_charts, stored)
+            windowed = clip_parsed(result, slice_)
+            tiles, generic_notes = _generic(windowed, canvas, max_charts, stored)
             notes.extend(generic_notes)
+            if not slice_.whole:
+                notes.append(
+                    f"{slice_.label} window: every metric was cut to that slice of "
+                    "its own readings, and a metric a file states once was kept"
+                )
 
     if not canvas.charts:
         notes.append(

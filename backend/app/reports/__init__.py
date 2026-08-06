@@ -5,12 +5,14 @@
 Part II catalogue of `guides/visual_guide.md`. `parse` is the fallback for a
 directory nobody has seen before, `charts` picks between the two and owns the
 generic forms, `style` is the one copy of the guide's §4 style block, `palette`
-holds the guide's colors and the validator it demands, and `store` is the
-on-disk report each analysis becomes.
+holds the guide's colors and the validator it demands, `window` is the static
+a%–b% slice an operator can analyse instead of the whole run, and `store` is
+the on-disk report each analysis becomes.
 """
 
 from __future__ import annotations
 
-from . import charts, palette, parse, runcharts, runlog, store, style
+from . import charts, palette, parse, runcharts, runlog, store, style, window
 
-__all__ = ["charts", "palette", "parse", "runcharts", "runlog", "store", "style"]
+__all__ = ["charts", "palette", "parse", "runcharts", "runlog", "store", "style",
+           "window"]

@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
+from .window import Window
+
 log = logging.getLogger(__name__)
 
 #: Extensions worth reading. Everything else in the directory is left alone --
@@ -411,6 +413,26 @@ def readable(path: Path) -> bool:
         except OSError:
             return False
     return False
+
+
+def apply_window(result: ParseResult, window: Window) -> ParseResult:
+    """Keep only the readings inside `window`, per metric and per file.
+
+    The slice is taken in printing order (`line`, then `order`), which is the
+    order `charts._series_for` plots them in -- so "the middle 85% of the
+    chart" and "the middle 85% of the log" are the same readings.
+
+    A metric a file mentions once survives any window. Those are the run's
+    summary values rather than a series, and dropping them because a narrow
+    window happened to miss their line would silently delete the stat tiles.
+    """
+    if window.whole:
+        return result
+    for metric in result.metrics.values():
+        for source, rows in metric.by_source.items():
+            rows.sort(key=lambda s: (s.line, s.order))
+            metric.by_source[source] = window.clip(rows)
+    return result
 
 
 def parse_tree(root: Path) -> ParseResult:

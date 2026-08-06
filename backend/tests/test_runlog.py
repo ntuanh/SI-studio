@@ -20,6 +20,7 @@ import pytest
 from app.reports import charts as chartmod
 from app.reports import parse as parsemod
 from app.reports import runcharts, runlog
+from app.reports.window import Window
 
 # --------------------------------------------------------------- the fixture
 # Small but structurally complete: two clusters, both roles, both mAP
@@ -468,3 +469,132 @@ def test_files_reporting_the_same_constant_are_not_a_comparison(tmp_path: Path) 
 
     charts, _, _ = render(source, tmp_path / "imgs")
     assert [c.id for c in charts if c.id in ("comparison", "delta")] == []
+
+
+# ------------------------------------------------------- the analysis window
+def test_the_window_keeps_the_batches_an_operator_asked_for() -> None:
+    """5 and 90 over 100 batches means batches 5 to 90 — inclusive, both ends."""
+    kept = list(range(*Window(5, 90).bounds(100)))
+
+    assert kept[0] == 4 and kept[-1] == 89       # 0-based: the 5th and the 90th
+    assert len(kept) == 86
+    assert Window(5, 90).clip(list(range(1, 101)))[:1] == [5]
+    assert Window(5, 90).clip(list(range(1, 101)))[-1:] == [90]
+
+
+def test_the_whole_run_is_the_default_and_costs_nothing() -> None:
+    rows = list(range(40))
+    assert Window().whole and Window().label == "whole run"
+    assert Window().clip(rows) == rows
+    assert Window().bounds(40) == (0, 40)
+
+
+def test_a_window_too_narrow_to_select_anything_still_yields_a_reading() -> None:
+    """An empty series is a chart that vanishes with nothing to say why."""
+    for count in (1, 2, 3, 7):
+        first, stop = Window(49, 51).bounds(count)
+        assert stop > first, count
+
+
+def test_a_nonsense_window_falls_back_to_the_whole_run() -> None:
+    """Second line behind the API's validator, for manifests it never saw."""
+    assert Window.of(90, 5).whole
+    assert Window.of(-10, 400) == Window(0.0, 100.0)
+    assert Window.of("x", None).whole                       # type: ignore[arg-type]
+    assert Window.from_dict({"start": 5, "end": 90}) == Window(5.0, 90.0)
+    assert Window.from_dict(None).whole
+
+
+def test_the_window_cuts_every_per_batch_series(run_dir: Path) -> None:
+    whole = runlog.read_run(run_dir)
+    part = runlog.read_run(run_dir, Window(20, 80))
+
+    assert len(part.system_fps) < len(whole.system_fps)
+    assert part.system_fps[0].at > whole.system_fps[0].at
+    assert part.system_fps[-1].at < whole.system_fps[-1].at
+    # Each cluster is cut at *its own* 20% mark, not at another cluster's.
+    for cluster, points in part.cluster_fps.items():
+        first, stop = Window(20, 80).bounds(len(whole.cluster_fps[cluster]))
+        assert [p.at for p in points] == [
+            p.at for p in whole.cluster_fps[cluster][first:stop]
+        ]
+    assert len(part.accuracy_window["Cluster 0"]) < 10
+
+
+def test_the_window_leaves_the_run_s_own_summary_lines_alone(run_dir: Path) -> None:
+    """`fps_cluster.log` holds one whole-run line; no slice can re-derive it."""
+    part = runlog.read_run(run_dir, Window(20, 80))
+
+    assert part.system("fps") == 25.220
+    assert part.utilization[("System", "all")]["utilization"] == 53.20
+    assert part.latency[("System", "all", "e2e")]["n"] == 504
+    assert part.accuracy[("Overall", "ALL")]["mAP50"] == 0.1634
+
+
+def test_a_cut_outside_the_window_is_dropped_rather_than_drawn_at_the_edge(
+    tmp_path: Path,
+) -> None:
+    """A split-point change is an event, so it is cut on the clock.
+
+    Kept, its marker would be drawn at whichever edge of the axes it fell past
+    and read as having happened inside the window.
+    """
+    # 1.4 s in: past the first half of this run's readings, inside the second.
+    late = f"{1785127877009606331 + 1_400_000_000} intermediate_queue_0: cut 11->12 deeper\n"
+    directory = write_run(tmp_path, **{"cut_change_ns.log": late})
+
+    assert len(runlog.read_run(directory).cuts) == 1
+    assert len(runlog.read_run(directory, Window(50, 100)).cuts) == 1
+    assert runlog.read_run(directory, Window(0, 50)).cuts == []
+
+
+def test_windowed_charts_say_which_scope_each_one_has(run_dir: Path, tmp_path: Path) -> None:
+    """Both ways round: an unmarked chart would be read as windowed too."""
+    charts, tiles, notes = chartmod.render(
+        parsemod.parse_tree(run_dir), tmp_path / "imgs",
+        source_dir=run_dir, window=Window(5, 90),
+    )
+    by_id = {c.id: c for c in charts}
+
+    assert "5–90% of the run" in by_id["system_window_fps"].subtitle
+    assert "5–90% of the run" in by_id["map_by_window"].subtitle
+    assert "whole run" in by_id["throughput_by_cluster"].subtitle
+    assert "whole run" in by_id["e2e_latency_profile"].subtitle
+    # The tiles are whole-run numbers sitting above windowed charts, so they
+    # carry the scope too — and the settings from config.yaml do not.
+    by_label = {t.label: t for t in tiles}
+    assert by_label["System throughput"].source.endswith("· whole run")
+    assert by_label["Batch size"].source == "config.yaml"
+    assert any("5–90% window" in n for n in notes)
+
+
+def test_the_generic_path_windows_its_metrics_too(tmp_path: Path) -> None:
+    source = tmp_path / "unknown"
+    source.mkdir()
+    (source / "edge.log").write_text(
+        "\n".join(f"edge_ms={i}" for i in range(100)), encoding="utf-8"
+    )
+
+    parsed = parsemod.parse_tree(source)
+    assert parsed.metrics["edge_ms"].count == 100
+    charts, _, notes = chartmod.render(parsed, tmp_path / "imgs", window=Window(5, 90))
+
+    # Readings 5..90 of the log, so the trend describes 86 of them.
+    assert parsed.metrics["edge_ms"].values == [float(v) for v in range(4, 90)]
+    assert any("86 readings" in c.summary for c in charts)
+    assert any("5–90% window" in n for n in notes)
+
+
+def test_a_windowed_run_still_reads_a_single_stated_value(tmp_path: Path) -> None:
+    """One reading per file is a summary, not a series — a window keeps it."""
+    source = tmp_path / "unknown"
+    source.mkdir()
+    (source / "edge.log").write_text(
+        "\n".join(f"edge_ms={i}" for i in range(60)) + "\nPeak memory 1284 MB\n",
+        encoding="utf-8",
+    )
+
+    _, tiles, _ = chartmod.render(
+        parsemod.parse_tree(source), tmp_path / "imgs", window=Window(90, 95)
+    )
+    assert [t.label for t in tiles] == ["Peak memory"]

@@ -48,6 +48,7 @@ from .style import (
     applied, grouped_x, headroom, label_bars, offsets, panel_legend,
     rolling_mean, smooth_window, suptitle, takeaway, tidy,
 )
+from .window import Window
 
 log = logging.getLogger(__name__)
 
@@ -742,6 +743,15 @@ def tiles(data: RunData) -> list[Tile]:
         if key in data.config:
             out.append(Tile(label=label, value=fmt(data.config[key]), unit=unit,
                             source="config.yaml"))
+
+    # Every measured tile above is a summary line the run computed over its own
+    # full duration, so an analysis window leaves them untouched. They sit at
+    # the top of the report, which is precisely why they have to say so — the
+    # settings from `config.yaml` are not measurements and need no scope.
+    if not data.window.whole:
+        for tile in out:
+            if tile.source != "config.yaml":
+                tile.source += " · whole run"
     return out
 
 
@@ -753,6 +763,33 @@ CATALOGUE: tuple[Callable[[Canvas, RunData, View], Chart | None], ...] = (
     fps_distribution, service_latency, e2e_profile, utilization_by_role,
     device_utilization, accuracy_by_window, accuracy_summary,
 )
+
+
+#: Charts drawn from a per-batch series, which is what an a%–b% window can
+#: actually narrow. Everything else in the catalogue comes from a file holding
+#: one summary line per cluster that the *run* computed over its whole
+#: duration; those numbers cannot be re-derived for a slice of it, so they keep
+#: describing the whole run and say so. See `window.py`.
+WINDOWED = frozenset({
+    "system_window_fps", "cluster_window_fps", "window_fps_distribution",
+    "map_by_window",
+})
+
+
+def _note_window(chart: Chart, window: Window) -> None:
+    """Stamp the scope onto a chart's subtitle, both ways round.
+
+    Both ways round is the point. Marking only the windowed charts would leave
+    a reader to assume the unmarked ones were windowed too -- and "throughput
+    25.2 FPS" beside a timeline of batches 5-90 is exactly the misreading this
+    exists to prevent.
+    """
+    scope = (
+        f"{window.label} of the run" if chart.id in WINDOWED
+        else f"whole run — this figure is the run's own summary line, which the "
+             f"{window.label} window cannot narrow"
+    )
+    chart.subtitle = f"{chart.subtitle} · {scope}" if chart.subtitle else scope
 
 
 def render(data: RunData, canvas: Canvas,
@@ -771,11 +808,24 @@ def render(data: RunData, canvas: Canvas,
             # lookup keyed on the function name would break the moment a chart
             # is renamed, so the ids are the contract and live in one place.
             view = stored.get(CHART_IDS[chart_fn.__name__], View())
-            if chart_fn(canvas, data, view) is None:
+            chart = chart_fn(canvas, data, view)
+            if chart is None:
                 log.debug("%s: no data in this run", chart_fn.__name__)
+            elif not data.window.whole:
+                _note_window(chart, data.window)
         except Exception as exc:  # noqa: BLE001 - one bad chart must not sink the report
             log.warning("%s failed: %s", chart_fn.__name__, exc, exc_info=True)
             notes.append(f"{chart_fn.__name__.replace('_', ' ')} skipped: {exc}")
+
+    if not data.window.whole:
+        narrowed = [c.title for c in canvas.charts if c.id in WINDOWED]
+        notes.append(
+            f"{data.window.label} window: cut from the per-batch logs, so "
+            + (", ".join(narrowed) if narrowed else "no chart in this run")
+            + " covers that slice. The throughput, latency, utilization and "
+              "accuracy summaries — and every stat tile — are the run's own "
+              "whole-run figures and are labelled as such."
+        )
     return notes
 
 

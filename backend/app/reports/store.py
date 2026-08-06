@@ -175,6 +175,10 @@ class Report:
     metrics: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     pulled: dict[str, Any] = field(default_factory=dict)
+    #: `{"start": 5.0, "end": 90.0, "label": "5–90%"}` — the slice of the run
+    #: these charts were drawn from. Empty on a whole-run report, and on every
+    #: report analysed before windows existed, which is the same thing.
+    window: dict[str, Any] = field(default_factory=dict)
     review: str = ""
     saved_at: str = ""
     #: When the PNGs were last drawn. The chart images are cached hard under
@@ -190,7 +194,7 @@ class Report:
             "device_name": self.device_name, "source_path": self.source_path,
             "charts": self.charts, "tiles": self.tiles, "files": self.files,
             "metrics": self.metrics, "warnings": self.warnings, "pulled": self.pulled,
-            "review": self.review, "saved_at": self.saved_at,
+            "window": self.window, "review": self.review, "saved_at": self.saved_at,
             "rendered_at": self.rendered_at,
         }
 
@@ -204,6 +208,10 @@ class Report:
             "source_path": self.source_path, "charts": len(self.charts),
             "notes": noted, "saved_at": self.saved_at,
             "rendered_at": self.rendered_at,
+            # In the row, so History can mark a partial run without opening it:
+            # two reports of one directory differing only by their window would
+            # otherwise be indistinguishable in the list.
+            "window": (self.window or {}).get("label", ""),
             "reviewed": bool(self.review.strip()) or noted > 0,
             # Split out so the history bar can group by day and label a run by
             # its time, instead of re-parsing a formatted string in the browser.
