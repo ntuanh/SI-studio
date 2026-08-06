@@ -1,30 +1,35 @@
-"""Analyse only part of a run: the batches between the a% and b% marks.
+"""Analyse a fixed slice of a run: from a% to b% of the system's own clock.
 
 A run's interesting stretch is rarely the whole file. The first batches are
 warm-up -- models loading, queues filling, the first frames going out before
 anything has settled -- and the last ones are the tail draining as the source
-runs out. Charted with everything else they drag the mean around and put a
-ramp on both ends of every timeline, which is the shape of the *harness*, not
-of the split.
+runs out. Charted with everything else they drag the mean around and put a ramp
+on both ends of every timeline, which is the shape of the *harness*, not of the
+split.
 
-So the operator can fix a static window before analysing: `5` to `90` keeps
-batches 5 through 90 of a hundred, and nothing outside them is read.
+So the operator fixes a static window before analysing: `5` to `95` throws away
+the first 5% and the last 5% of the run and reports the rest.
 
-**Static** is the whole design. The bounds are chosen once, applied to every
-series in the report, and stored with it -- so a window is a property of the
-report the same way the source directory is, and re-drawing a chart months
-later produces the same figure. There is no auto-detected warm-up here on
-purpose: a threshold that moves by itself would make two reports of the same
-run disagree with no record of why.
+**One clock for the whole report.** The window is a span of wall-clock time
+taken from the system's own run -- first batch completed to last batch
+completed -- and every series, every event and every recomputed figure is cut
+to that same span. It is deliberately *not* a per-series slice: cutting each
+cluster at its own 5% mark would give the clusters different spans, and then
+"cluster 0 against cluster 1" compares two different stretches of the run,
+which is the one thing a comparison must never do.
 
-What a window can and cannot narrow is the other half of the contract. The
-per-batch series -- `batch_done_ns.log`, `fps_cluster_ns.log`, `map_window.log`
--- are sequences of readings, so a slice of them is a real measurement of that
-stretch. The summary files are not: `fps_cluster.log` holds one line per
-cluster that the *run* computed over its own full duration, and no arithmetic
-here can turn that into the throughput of batches 5-90. Those charts keep
-saying "whole run", out loud, rather than being quietly re-labelled (see
-`runcharts.render`).
+**Recomputed, not relabelled.** Where the run wrote the raw per-batch events,
+the summary figures are computed again from the events inside the span, by the
+same recipe the run used -- see `runlog.recompute`. Throughput is the clearest
+case: 504 batches over 1340 s is 12.0 FPS, and the same arithmetic over the
+454 batches inside a 5-95% span is the throughput of that span.
+
+**Static** is the rest of the design. The bounds are chosen once, applied to
+every series in the report, and stored with it -- so a window is a property of
+the report the way the source directory is, and re-drawing a chart months later
+produces the same figure. There is no auto-detected warm-up on purpose: a
+threshold that moved by itself would make two reports of the same run disagree
+with no record of why.
 """
 
 from __future__ import annotations
@@ -47,18 +52,12 @@ _EPSILON = 1e-9
 
 @dataclass(frozen=True)
 class Window:
-    """The `start`-`end` percent slice of a run to analyse. Both inclusive.
+    """The `start`-`end` percent slice of a run to analyse. Both ends inclusive.
 
-    Positions are counted over the readings a series holds, not over the clock:
-    reading *k* of *n* sits at `100 * k / n` percent, and is kept when that
-    falls inside the band. With 100 batches, `Window(5, 90)` keeps batches 5
-    through 90 -- which is what an operator who typed 5 and 90 asked for.
-
-    Counting over readings rather than seconds is deliberate. A stalled cluster
-    emits fewer batches per second, so a wall-clock slice would take a
-    different number of batches from each of them; the percentages then mean
-    something different per series, which is exactly the drift a *static*
-    window exists to avoid.
+    The percentages are of the run's **elapsed time**, measured on the system
+    clock the result files already share: `Window(5, 95)` over a 1340-second
+    run is the 1206 seconds between 67 s and 1273 s in, and everything the run
+    recorded with a timestamp is judged against those two moments.
     """
 
     start: float = FULL_START
@@ -101,16 +100,45 @@ class Window:
 
     @property
     def label(self) -> str:
-        """`5–90%` — the en dash, because it is a range and not a subtraction."""
+        """`5–95%` — the en dash, because it is a range and not a subtraction."""
         if self.whole:
             return "whole run"
         return f"{_trim(self.start)}–{_trim(self.end)}%"
 
+    # ------------------------------------------------------- the time span
+    def span(self, first: float, last: float) -> tuple[float, float]:
+        """`(from, to)` on the run's own clock, given when it started and ended.
+
+        This is the one place the percentages become moments. Every caller cuts
+        against the pair this returns, which is what keeps a cluster series, a
+        split-point marker and a recomputed throughput describing the same
+        stretch of the same run.
+        """
+        length = max(last - first, 0.0)
+        return first + length * self.start / 100.0, first + length * self.end / 100.0
+
+    def holds(self, at: float, span: tuple[float, float]) -> bool:
+        """Is a moment inside the span? Half-open: `(from, to]`. NaN never is.
+
+        Open at the start on purpose. A batch that completed *at* the opening
+        moment did its work before the window, so counting it would put one
+        batch's worth of frames into a stretch that did not produce them --
+        and a rate over the span is exactly what gets recomputed here.
+
+        This is not a technicality invented for the edge case: it is the run's
+        own convention. `steady_fps` is `(done - 1) * batch_size / elapsed` --
+        every completion after the first, over the time since the first -- so a
+        window covering the whole clock reproduces it exactly.
+        """
+        return bool(math.isfinite(at) and span[0] < at <= span[1])
+
+    # ------------------------------- readings, for logs with no usable clock
     def bounds(self, count: int) -> tuple[int, int]:
         """`(first, stop)` indices into a series of `count` readings.
 
-        Reading *k* (1-based) is kept when `start <= 100k/count <= end`, so the
-        pair is `ceil(count*start/100) - 1` and `floor(count*end/100)`.
+        The fallback for the schema-blind path, where files share no clock and
+        a reading's position in the file is the only ordering there is.
+        Reading *k* (1-based) is kept when `start <= 100k/count <= end`.
 
         A window narrow enough to select nothing still yields one reading. An
         empty series is a chart that silently disappears, and "your window was

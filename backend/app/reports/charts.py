@@ -636,8 +636,11 @@ def render(
             notes.extend(generic_notes)
             if not slice_.whole:
                 notes.append(
-                    f"{slice_.label} window: every metric was cut to that slice of "
-                    "its own readings, and a metric a file states once was kept"
+                    f"{slice_.label} window: these files share no run clock — "
+                    "nothing here says when a reading was taken relative to "
+                    "anything else — so each metric was cut to that fraction of "
+                    "its own readings instead, and a value a file states once "
+                    "was kept whole"
                 )
 
     if not canvas.charts:

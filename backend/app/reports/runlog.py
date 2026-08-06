@@ -80,6 +80,13 @@ def num(raw: str | None) -> float:
         return math.nan
 
 
+def _batch_range(raw: str | None) -> tuple[float, float]:
+    """`'12-27'` -> (12.0, 27.0). `nan`s when the field is missing or odd."""
+    first, _, last = (raw or "").partition("-")
+    lo, hi = num(first), num(last)
+    return (lo, hi) if math.isfinite(lo) and math.isfinite(hi) else (math.nan, math.nan)
+
+
 def _split(line: str) -> tuple[int | None, list[str], dict[str, str], str]:
     """`<ns> [FLAGS] k=v k=v` -> (ns, [FLAGS], {k: v}, body). The one line reader."""
     ts_match = _NS.match(line)
@@ -121,6 +128,17 @@ class RunData:
     #: fps_cluster_ns.log — cluster -> its own rolling window series
     cluster_fps: dict[str, list[Point]] = field(default_factory=dict)
 
+    #: Every batch completion, in seconds from the first one — including the
+    #: warm-up batches that carry no rolling FPS yet. This is the raw event
+    #: stream `throughput` is a summary *of*, and the reason a window can
+    #: recompute that summary rather than only relabel it.
+    system_batches: list[float] = field(default_factory=list)
+    #: The same events split by cluster (`fps_cluster_ns.log`).
+    cluster_batches: dict[str, list[float]] = field(default_factory=dict)
+    #: When the run ended, in seconds from its first batch. The full system
+    #: span every window percentage is measured against.
+    span_s: float = 0.0
+
     #: utilization_cluster.log — (scope, role) -> {utilization, …}. `role` is
     #: "all" on the rolled-up lines, which is what the guide's C7 x-axis is.
     utilization: dict[tuple[str, str], dict[str, float]] = field(default_factory=dict)
@@ -140,10 +158,15 @@ class RunData:
     #: config.yaml — the settings that produced these numbers
     config: dict[str, float] = field(default_factory=dict)
 
-    #: The slice of the run the series above were cut to. The summary fields
-    #: (`throughput`, `utilization`, `latency`, `accuracy`) are untouched by
-    #: it — see `window.py` for why they cannot be.
+    #: The slice of the run everything above was cut to, and the two moments
+    #: (seconds from the first batch) it worked out to on this run's clock.
     window: Window = field(default_factory=Window)
+    window_span: tuple[float, float] | None = None
+    #: Which summaries the window worked out again from the raw events, rather
+    #: than inherited from the run's own totals. A chart is only labelled
+    #: "recomputed" if its name is in here, so a run that did not write the
+    #: events cannot end up with a whole-run number wearing a window's label.
+    recomputed: set[str] = field(default_factory=set)
 
     warnings: list[str] = field(default_factory=list)
 
@@ -166,6 +189,24 @@ class RunData:
 
     def system(self, field_: str) -> float:
         return self.throughput.get(SYSTEM, {}).get(field_, math.nan)
+
+    @property
+    def batch_size(self) -> float:
+        """Frames per batch. `config.yaml` if it says, else what the run counted.
+
+        The archived config writes it as `batch-size` under `server:`, and some
+        runs do not archive a config at all -- but `fps_cluster.log` always
+        carries `frames` and `done`, and their ratio is the same number.
+        """
+        for key in ("batch_size", "batch-size"):
+            size = self.config.get(key, math.nan)
+            if math.isfinite(size) and size > 0:
+                return size
+        for stats in self.throughput.values():
+            frames, done = stats.get("frames", math.nan), stats.get("done", math.nan)
+            if math.isfinite(frames) and math.isfinite(done) and done > 0:
+                return frames / done
+        return math.nan
 
 
 # ------------------------------------------------------------- file readers
@@ -216,6 +257,7 @@ def read_system_fps(root: Path, data: RunData) -> None:
     the clock and contribute no point.
     """
     rows: list[tuple[int, float]] = []
+    events: list[int] = []
     base: int | None = None
     for line in _lines(root, "batch_done_ns.log"):
         parts = line.split()
@@ -224,12 +266,18 @@ def read_system_fps(root: Path, data: RunData) -> None:
         ts = int(parts[0])
         if base is None:
             base = ts
+        events.append(ts)
         if len(parts) >= 2:
             value = num(parts[1])
             if not math.isnan(value):
                 rows.append((ts, value))
     if base is not None:
         data.base_ns = base
+        # Every completion, warm-up included. The rolling-FPS column starts
+        # fifteen batches in, but the run's clock starts at the first DONE --
+        # and it is that clock the window's percentages are measured against.
+        data.system_batches = [(ts - base) / 1e9 for ts in events]
+        data.span_s = data.system_batches[-1] if data.system_batches else 0.0
     if rows and base is not None:
         rows.insert(0, (base, math.nan))          # anchor t=0 at the first DONE
         data.system_fps = [p for p in _series(rows) if not math.isnan(p.value)]
@@ -238,6 +286,7 @@ def read_system_fps(root: Path, data: RunData) -> None:
 def read_cluster_fps(root: Path, data: RunData) -> None:
     """`fps_cluster_ns.log` §2.2 — the same arrivals, bucketed by cluster."""
     rows: dict[str, list[tuple[int, float]]] = {}
+    events: dict[str, list[int]] = {}
     base: int | None = None
     for line in _lines(root, "fps_cluster_ns.log"):
         ts, _, kv, _body = _split(line)
@@ -246,16 +295,35 @@ def read_cluster_fps(root: Path, data: RunData) -> None:
         if base is None:
             base = ts
         cluster = cluster_label(kv.get("cluster", ""))
-        if not cluster or "window_fps" not in kv:
+        if not cluster:
+            continue
+        # Every arrival, whether or not it carries a window reading yet: this
+        # is what a windowed throughput is counted from.
+        events.setdefault(cluster, []).append(ts)
+        if "window_fps" not in kv:
             continue
         value = num(kv["window_fps"])
         if not math.isnan(value):
             rows.setdefault(cluster, []).append((ts, value))
 
+    # The system clock, so a cluster's events land on the same axis as the
+    # system's. `base_ns` is set by `read_system_fps`, which runs first.
+    clock = data.base_ns if data.base_ns is not None else base
+    for cluster, stamps in events.items():
+        if clock is not None:
+            data.cluster_batches[cluster] = [(ts - clock) / 1e9 for ts in stamps]
+        if cluster not in data.clusters:
+            data.clusters.append(cluster)
+
     for cluster, samples in rows.items():
-        if base is not None:
-            samples.insert(0, (base, math.nan))   # every cluster shares one clock
-        data.cluster_fps[cluster] = [p for p in _series(samples) if not math.isnan(p.value)]
+        # Measured from the system's first DONE rather than from this file's
+        # own first line, so a cluster series, a cut marker and the window's
+        # own two moments are all points on one axis.
+        origin = clock if clock is not None else samples[0][0]
+        data.cluster_fps[cluster] = [
+            Point(index=i, at=(ts - origin) / 1e9, value=value)
+            for i, (ts, value) in enumerate(samples)
+        ]
         if cluster not in data.clusters:
             data.clusters.append(cluster)
 
@@ -322,9 +390,14 @@ def read_accuracy(root: Path, data: RunData) -> None:
         cluster = cluster_label(kv.get("cluster", ""))
         if not cluster or "window" not in kv:
             continue
+        # `batches=12-27` is the only thing on this line that says *when* the
+        # window happened; without it a time window has no way to place it.
+        first, last = _batch_range(kv.get("batches"))
         data.accuracy_window.setdefault(cluster, []).append({
             "window": num(kv["window"]),
             "frames": num(kv.get("frames")),
+            "first_batch": first,
+            "last_batch": last,
             "mAP50": num(kv.get("mAP50")),
             "mAP50_95": num(kv.get("mAP50_95")),
         })
@@ -395,39 +468,206 @@ def tag_of(root: Path) -> str:
     return tail if tail in ("dynamic", "split", "only_cloud", "only_edge") else ""
 
 
+#: What a window cannot touch, and why. These files hold one finished total
+#: each -- `busy_s`/`total_s` accumulated per device, latency already reduced
+#: to mean/p50/p95/max, mAP already matched frame by frame -- and the run did
+#: not write the per-batch series any of them were summed from. There is no
+#: arithmetic here that recovers the utilization of batches 25-478 from a
+#: single cumulative busy time, so those figures stay whole-run and say so.
+WHOLE_RUN_ONLY = (
+    "device utilization (only a cumulative busy/total per device was written)",
+    "service, pipeline and end-to-end latency (only n/mean/p50/p95/max)",
+    "accuracy over all frames (only the finished per-frame match)",
+)
+
+
+def recompute(data: RunData, span: tuple[float, float]) -> None:
+    """Redo the throughput and windowed-accuracy summaries over `span`.
+
+    The same arithmetic the run itself used, applied to the events inside the
+    window instead of to all of them:
+
+    * **throughput** — count the batch completions between the two moments,
+      multiply by the batch size for frames, divide by the span's length. On a
+      whole run this reproduces the run's own `steady_fps` (frames after the
+      first DONE over the elapsed time), which is the check that the recipe is
+      the right one.
+    * **accuracy WINDOW** — `map.log`'s own note says it is "mean of N
+      window(s)", so the mean of the windows left inside the span *is* that
+      figure computed for the span.
+
+    `steady_fps` is dropped rather than recomputed: it exists to name the rate
+    with the warm-up taken off, and a window that excluded the warm-up has
+    already done that. Two bars meaning the same thing is a comparison that is
+    not in the data.
+    """
+    low, high = span
+    elapsed = high - low
+    size = data.batch_size
+    counts = {
+        cluster: sum(1 for at in stamps if low < at <= high)
+        for cluster, stamps in data.cluster_batches.items()
+    }
+    system_done = sum(1 for at in data.system_batches if low < at <= high)
+    # A run with one cluster writes the same events to both files; prefer the
+    # system log, and fall back to the clusters when it was not written.
+    total = system_done or sum(counts.values())
+
+    # No events, no arithmetic. Leaving the run's own totals in place is the
+    # honest outcome -- they are then labelled whole-run like the rest, rather
+    # than a stale figure wearing the window's name.
+    if elapsed > 0 and math.isfinite(size) and total:
+        for cluster, done in counts.items():
+            stats = dict(data.throughput.get(cluster, {}))
+            stats.pop("steady_fps", None)
+            stats.update(done=float(done), frames=done * size,
+                         fps=done * size / elapsed,
+                         share=done / total * 100.0)
+            data.throughput[cluster] = stats
+
+        stats = dict(data.throughput.get(SYSTEM, {}))
+        stats.pop("steady_fps", None)
+        stats.update(done=float(total), frames=total * size,
+                     fps=total * size / elapsed)
+        data.throughput[SYSTEM] = stats
+        data.recomputed.add("throughput")
+
+    # `map.log`'s WINDOW row says of itself "mean of N window(s)", so the mean
+    # over the windows left inside the span is that same figure for the span.
+    # The rows have already been cut to the span by the caller.
+    for cluster, rows in data.accuracy_window.items():
+        means = {
+            key: [r[key] for r in rows if math.isfinite(r.get(key, math.nan))]
+            for key in ("mAP50", "mAP50_95")
+        }
+        if all(means.values()):
+            data.accuracy[(cluster, "WINDOW")] = {
+                key: sum(values) / len(values) for key, values in means.items()
+            }
+            data.recomputed.add("accuracy_window")
+        else:
+            # No window survived: the run scored no frames in this stretch, and
+            # a stale whole-run figure under a windowed heading would be a lie.
+            data.accuracy.pop((cluster, "WINDOW"), None)
+
+    scored = [
+        data.accuracy[(c, "WINDOW")] for c in data.accuracy_window
+        if (c, "WINDOW") in data.accuracy
+    ]
+    if (OVERALL, "WINDOW") in data.accuracy:
+        if scored:
+            data.accuracy[(OVERALL, "WINDOW")] = {
+                key: sum(s[key] for s in scored) / len(scored)
+                for key in ("mAP50", "mAP50_95")
+            }
+        else:
+            data.accuracy.pop((OVERALL, "WINDOW"), None)
+
+
 def apply_window(data: RunData, window: Window) -> RunData:
-    """Cut every per-batch series down to `window`, in place.
+    """Cut the run to `window` and recompute what the events support, in place.
 
-    Each series is sliced on its own length rather than on a shared clock: they
-    are all one-reading-per-batch, so the same percentage lands at the same
-    point in the run for each of them, and a cluster that produced fewer
-    batches is still cut at *its* 5% mark rather than at another cluster's.
-
-    `cuts` is the exception, because a split-point change is an event at an
-    arbitrary moment rather than a reading. Those are cut on the clock, to the
-    span the kept readings actually cover — a marker for a change that happened
-    outside the window would be drawn at the edge of the axes and read as
-    having happened inside it.
+    One span, taken from the system's own clock, judges everything: the FPS
+    series, each cluster's series, the split-point markers and the mAP windows.
+    Cutting each series at its own 5% mark instead would hand the clusters
+    different stretches of the run, and comparing those is the one thing the
+    charts must not do.
     """
     data.window = window
     if window.whole:
         return data
 
-    data.system_fps = window.clip(data.system_fps)
-    data.cluster_fps = {c: window.clip(points) for c, points in data.cluster_fps.items()}
-    data.accuracy_window = {
-        c: window.clip(rows) for c, rows in data.accuracy_window.items()
-    }
+    # The window is a span of the system's clock, so without one there is
+    # nothing to measure it against. Refusing beats guessing: cutting on a
+    # made-up span would drop most of the run and say nothing about why.
+    if data.span_s <= 0:
+        latest = max((s[-1] for s in data.cluster_batches.values() if s), default=0.0)
+        data.span_s = latest
+    if data.span_s <= 0:
+        data.window = Window()
+        data.warnings.append(
+            f"the {window.label} window was not applied: this run wrote no "
+            "batch timestamps, so it has no clock to measure a window on"
+        )
+        return data
 
-    kept = [p for points in (data.system_fps, *data.cluster_fps.values()) for p in points]
-    if kept and data.cuts:
-        first, last = min(p.at for p in kept), max(p.at for p in kept)
-        data.cuts = [
-            cut for cut in data.cuts
-            if math.isfinite(float(cut.get("at", math.nan)))
-            and first <= float(cut["at"]) <= last
-        ]
+    span = window.span(0.0, data.span_s)
+    data.window_span = span
+
+    def inside(at: float) -> bool:
+        return window.holds(at, span)
+
+    # mAP's sliding windows are numbered by batch, not stamped with a time, so
+    # they are placed on the clock through the completion times of the batches
+    # they cover. That has to happen before the completions themselves are cut.
+    before = {c: len(rows) for c, rows in data.accuracy_window.items()}
+    data.accuracy_window = {
+        c: [r for r in rows if _scored_inside(data.system_batches, r, span)]
+        for c, rows in data.accuracy_window.items()
+    }
+    _warn_about_lost_scoring(data, before, span)
+
+    data.system_fps = [p for p in data.system_fps if inside(p.at)]
+    data.cluster_fps = {
+        c: [p for p in points if inside(p.at)] for c, points in data.cluster_fps.items()
+    }
+    data.system_batches = [at for at in data.system_batches if inside(at)]
+    data.cluster_batches = {
+        c: [at for at in stamps if inside(at)] for c, stamps in data.cluster_batches.items()
+    }
+    data.cuts = [c for c in data.cuts if inside(float(c.get("at", math.nan)))]
+
+    recompute(data, span)
     return data
+
+
+def _warn_about_lost_scoring(
+    data: RunData, before: dict[str, int], span: tuple[float, float]
+) -> None:
+    """Say when a window fell outside where the run actually scored accuracy.
+
+    mAP is only computed over frames that have ground truth, and a run can
+    carry those for a small stretch near the start -- 14 windows over batches
+    0-28 of 504 is a real example. A window past that stretch legitimately
+    keeps none of them, and the accuracy charts then do not draw at all. That
+    is a fact about the run worth a sentence, not a chart quietly missing.
+    """
+    for cluster, had in before.items():
+        kept = len(data.accuracy_window.get(cluster, []))
+        if not had or kept == had:
+            continue
+        note = (
+            f"{cluster}: {had - kept} of {had} mAP scoring window(s) fall "
+            f"outside {data.window.label} ({span[0]:,.0f}s–{span[1]:,.0f}s)"
+        )
+        if not kept:
+            note += (
+                " — none are left, so the accuracy charts are not drawn. This "
+                "run only scored frames outside the window; mAP needs ground "
+                "truth, and it covers whichever batches had it"
+            )
+        data.warnings.append(note)
+
+
+def _scored_inside(
+    batches: list[float], row: dict[str, float], span: tuple[float, float]
+) -> bool:
+    """Does this mAP window's batch range sit wholly inside the time span?
+
+    Both ends must be in, not merely the start: a window straddling the edge
+    averages frames from outside the span, and folding that into a windowed
+    mAP would put data the operator excluded back into the headline.
+
+    Batch *k* finished at the *k*-th completion the run recorded, which is the
+    bridge from `batches=12-27` to two moments on the clock.
+    """
+    first, last = row.get("first_batch", math.nan), row.get("last_batch", math.nan)
+    if not (math.isfinite(first) and math.isfinite(last)):
+        return False
+    lo, hi = int(first), int(last)
+    if not batches or lo < 0 or hi >= len(batches):
+        return False
+    return span[0] < batches[lo] and batches[hi] <= span[1]
 
 
 def read_run(root: Path, window: Window | None = None) -> RunData:

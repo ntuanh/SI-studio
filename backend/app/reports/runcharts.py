@@ -41,7 +41,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from . import palette as pal
-from .runlog import OVERALL, SYSTEM, Point, RunData
+from .runlog import OVERALL, SYSTEM, WHOLE_RUN_ONLY, Point, RunData
 from .style import (
     AXIS, INK_2, LINE_KW, MARKER_MAX, MARK_KW, MUTED, S1, S2, SURFACE,
     TINT, BAR_KW, Canvas, Chart, Shown, Tile, View, band, entity_colors, fmt,
@@ -744,14 +744,18 @@ def tiles(data: RunData) -> list[Tile]:
             out.append(Tile(label=label, value=fmt(data.config[key]), unit=unit,
                             source="config.yaml"))
 
-    # Every measured tile above is a summary line the run computed over its own
-    # full duration, so an analysis window leaves them untouched. They sit at
-    # the top of the report, which is precisely why they have to say so — the
-    # settings from `config.yaml` are not measurements and need no scope.
+    # The tiles are the first numbers anyone reads, which is exactly why each
+    # has to say which run it describes. Throughput was recounted from the
+    # batch events inside the window; the other three are finished totals the
+    # window cannot re-derive. The settings from `config.yaml` are not
+    # measurements and need no scope.
     if not data.window.whole:
+        recounted = {"fps_cluster.log"} if "throughput" in data.recomputed else set()
         for tile in out:
-            if tile.source != "config.yaml":
-                tile.source += " · whole run"
+            if tile.source == "config.yaml":
+                continue
+            tile.source += (f" · {data.window.label}" if tile.source in recounted
+                            else " · whole run")
     return out
 
 
@@ -765,30 +769,56 @@ CATALOGUE: tuple[Callable[[Canvas, RunData, View], Chart | None], ...] = (
 )
 
 
-#: Charts drawn from a per-batch series, which is what an a%–b% window can
-#: actually narrow. Everything else in the catalogue comes from a file holding
-#: one summary line per cluster that the *run* computed over its whole
-#: duration; those numbers cannot be re-derived for a slice of it, so they keep
-#: describing the whole run and say so. See `window.py`.
+#: Charts whose numbers are the window's own, in one of two ways.
+#:
+#: `WINDOWED` are series: readings the run emitted with a timestamp, filtered
+#: to the span. `RECOMPUTED` are summaries the window worked out again from the
+#: raw events inside it — the throughput counted off the batch completions, the
+#: mAP averaged over the sliding windows that fall inside.
+#:
+#: Everything else comes from a file holding one finished total that the run
+#: never wrote the per-batch series for (see `runlog.WHOLE_RUN_ONLY`). Those
+#: keep describing the whole run and say so.
 WINDOWED = frozenset({
     "system_window_fps", "cluster_window_fps", "window_fps_distribution",
     "map_by_window",
 })
+RECOMPUTED = frozenset({"throughput_by_cluster"})
 
 
-def _note_window(chart: Chart, window: Window) -> None:
-    """Stamp the scope onto a chart's subtitle, both ways round.
+def _note_window(chart: Chart, data: RunData) -> None:
+    """Stamp the scope onto a chart's subtitle, every chart, both ways round.
 
-    Both ways round is the point. Marking only the windowed charts would leave
-    a reader to assume the unmarked ones were windowed too -- and "throughput
-    25.2 FPS" beside a timeline of batches 5-90 is exactly the misreading this
-    exists to prevent.
+    Both ways round is the point. Marking only the narrowed charts would leave
+    a reader to assume the unmarked ones were narrowed too -- and "46.9%
+    utilization" beside a timeline of the middle 90% of a run is exactly the
+    misreading this exists to prevent.
+
+    Every branch reads what actually happened rather than what was meant to:
+    a run that wrote no batch events gets no "recomputed" label, and the
+    accuracy summary only claims a windowed mean when a windowed mean survived
+    to be drawn.
     """
-    scope = (
-        f"{window.label} of the run" if chart.id in WINDOWED
-        else f"whole run — this figure is the run's own summary line, which the "
-             f"{window.label} window cannot narrow"
-    )
+    label = data.window.label
+    whole = ("whole run — the run wrote only a finished total for this, "
+             f"so the {label} window cannot re-derive it")
+
+    if chart.id == "map_summary":
+        # Two columns, and they need not both be there: WINDOW is a mean over
+        # the scoring windows inside the span, and a span holding none of them
+        # leaves the all-frames figure alone on the chart.
+        if any(agg == "WINDOW" for _, agg in data.accuracy):
+            scope = (f"the window mean is recomputed over the scoring windows "
+                     f"inside {label}; the all-frames figure is the run's own, "
+                     "matched frame by frame over everything")
+        else:
+            scope = whole
+    elif chart.id in RECOMPUTED and "throughput" in data.recomputed:
+        scope = f"recomputed over {label} of the run"
+    elif chart.id in WINDOWED:
+        scope = f"{label} of the run"
+    else:
+        scope = whole
     chart.subtitle = f"{chart.subtitle} · {scope}" if chart.subtitle else scope
 
 
@@ -812,19 +842,24 @@ def render(data: RunData, canvas: Canvas,
             if chart is None:
                 log.debug("%s: no data in this run", chart_fn.__name__)
             elif not data.window.whole:
-                _note_window(chart, data.window)
+                _note_window(chart, data)
         except Exception as exc:  # noqa: BLE001 - one bad chart must not sink the report
             log.warning("%s failed: %s", chart_fn.__name__, exc, exc_info=True)
             notes.append(f"{chart_fn.__name__.replace('_', ' ')} skipped: {exc}")
 
     if not data.window.whole:
-        narrowed = [c.title for c in canvas.charts if c.id in WINDOWED]
+        low, high = data.window_span or (0.0, data.span_s)
         notes.append(
-            f"{data.window.label} window: cut from the per-batch logs, so "
-            + (", ".join(narrowed) if narrowed else "no chart in this run")
-            + " covers that slice. The throughput, latency, utilization and "
-              "accuracy summaries — and every stat tile — are the run's own "
-              "whole-run figures and are labelled as such."
+            f"{data.window.label} window = {low:,.0f}s–{high:,.0f}s of a "
+            f"{data.span_s:,.0f}s run, one span for every chart. Throughput is "
+            f"recounted from the {len(data.system_batches)} batch(es) that "
+            "finished inside it; the FPS series and mAP windows are filtered "
+            "to it."
+        )
+        notes.append(
+            "still whole-run, because the run wrote only the finished total: "
+            + "; ".join(WHOLE_RUN_ONLY)
+            + ". Those charts and the stat tiles are labelled."
         )
     return notes
 

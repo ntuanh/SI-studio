@@ -241,12 +241,16 @@
    *
    * The first batches of a run are warm-up and the last are the tail draining,
    * and both drag every mean and every axis around. The window is the operator
-   * saying "batches 5 to 90 of a hundred" once, before analysing, so the whole
-   * report is drawn from the same stretch.
+   * saying "the middle 90% of the run" once, before analysing, so the whole
+   * report describes the same stretch.
+   *
+   * The percentages are of the system's own clock, and one span cuts every
+   * chart -- not each series at its own mark, which would hand the clusters
+   * different stretches and make comparing them meaningless.
    *
    * Static by design (see app/reports/window.py): the bounds are typed, stored
    * with the report, and re-used verbatim whenever its charts are re-drawn. */
-  var VIZ_WINDOW_DEFAULT = { windowStart: '5', windowEnd: '90' };
+  var VIZ_WINDOW_DEFAULT = { windowStart: '5', windowEnd: '95' };
 
   /* What a window box currently holds. `undefined` is a box nobody has touched
    * and takes the default; `''` is one that was deliberately cleared and stays
@@ -267,7 +271,7 @@
     var start = parseFloat(vizWindowText(viz, 'windowStart'));
     var end = parseFloat(vizWindowText(viz, 'windowEnd'));
     if (isNaN(start) || isNaN(end)) {
-      return { error: 'the window needs two numbers — 5 and 90 charts batches 5 to 90 of 100' };
+      return { error: 'the window needs two numbers — 5 and 95 drops the first and last twentieth of the run' };
     }
     if (start < 0 || end > 100) {
       return { error: 'the window is a percentage of the run, so both ends sit in 0–100' };
@@ -2855,17 +2859,20 @@
         windowEnd: vizWindowText(viz, 'windowEnd'),
         onWindowStart: function (e) { self.vizPatch({ windowStart: e.target.value }); },
         onWindowEnd: function (e) { self.vizPatch({ windowEnd: e.target.value }); },
-        // Says what the two numbers will do to *this* run rather than in
-        // general, and says the limit out loud: the summary files hold one
-        // whole-run line each, and no window can re-cut those.
+        // Says what the two numbers will do, and says the limit out loud in
+        // the same breath. Which charts change and which cannot is the thing
+        // an operator has to know *before* reading the report, not after.
         windowHint: (function () {
           var w = vizWindowOf(viz);
           if (!w) return '';
           if (w.error) return '✗ ' + w.error;
-          return vizWindowLabel(w) + ' of the run — batches ' + Math.ceil(w.start) +
-            ' to ' + Math.floor(w.end) + ' of 100, on every per-batch chart. ' +
-            'The throughput, latency, utilization and accuracy summaries are ' +
-            'whole-run figures and stay that way.';
+          return 'Keeps the middle ' + fmtPct(w.end - w.start) + '% of the run: ' +
+            'from ' + fmtPct(w.start) + '% to ' + fmtPct(w.end) + '% of the ' +
+            'system clock, one span for every chart. Throughput is recounted ' +
+            'from the batches that finished inside it; the FPS timelines, the ' +
+            'FPS spread and the mAP windows are cut to it. Utilization and ' +
+            'latency stay whole-run — the run writes only a finished total ' +
+            'for those, with no per-batch series to re-add.';
         })(),
         windowHintStyle: (function () {
           var w = vizWindowOf(viz);

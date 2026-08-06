@@ -505,30 +505,144 @@ def test_a_nonsense_window_falls_back_to_the_whole_run() -> None:
     assert Window.from_dict(None).whole
 
 
-def test_the_window_cuts_every_per_batch_series(run_dir: Path) -> None:
+def test_the_window_is_one_span_of_the_system_clock(run_dir: Path) -> None:
+    """Every series is judged against the same two moments, not its own length.
+
+    Cutting each cluster at its own 20% mark would hand them different
+    stretches of the run, and then comparing the clusters compares two
+    different experiments.
+    """
     whole = runlog.read_run(run_dir)
     part = runlog.read_run(run_dir, Window(20, 80))
+    low, high = part.window_span
 
-    assert len(part.system_fps) < len(whole.system_fps)
-    assert part.system_fps[0].at > whole.system_fps[0].at
-    assert part.system_fps[-1].at < whole.system_fps[-1].at
-    # Each cluster is cut at *its own* 20% mark, not at another cluster's.
+    assert (low, high) == pytest.approx((0.2 * whole.span_s, 0.8 * whole.span_s))
+    assert all(low <= p.at <= high for p in part.system_fps)
+    for points in part.cluster_fps.values():
+        assert all(low <= p.at <= high for p in points)
+    # …and every reading of the whole run inside the span is still here.
+    assert [p.at for p in part.system_fps] == [
+        p.at for p in whole.system_fps if low <= p.at <= high
+    ]
     for cluster, points in part.cluster_fps.items():
-        first, stop = Window(20, 80).bounds(len(whole.cluster_fps[cluster]))
         assert [p.at for p in points] == [
-            p.at for p in whole.cluster_fps[cluster][first:stop]
+            p.at for p in whole.cluster_fps[cluster] if low <= p.at <= high
         ]
-    assert len(part.accuracy_window["Cluster 0"]) < 10
 
 
-def test_the_window_leaves_the_run_s_own_summary_lines_alone(run_dir: Path) -> None:
-    """`fps_cluster.log` holds one whole-run line; no slice can re-derive it."""
+#: A run whose summary line and whose event stream are the same measurement,
+#: which the shared fixture above deliberately is not. 100 batches 100 ms
+#: apart is a 9.9 s clock, and 32 frames each makes `steady_fps` exactly
+#: 99 * 32 / 9.9 = 320 -- a number the recompute has to land on.
+def write_consistent_run(root: Path, batches: int = 100, step_ms: int = 100) -> Path:
+    base, step = 1785127877009606331, step_ms * 1_000_000
+    span = (batches - 1) * step_ms / 1000
+    return write_run(root, name="results_0729_2204_split", **{
+        "batch_done_ns.log": "".join(
+            f"{base + i * step}" + (f" {32 / (step_ms / 1000):.2f}" if i >= 15 else "")
+            + "\n" for i in range(batches)
+        ),
+        "fps_cluster_ns.log": "".join(
+            f"{base + i * step} cluster=intermediate_queue_0 done={i + 1}"
+            + (f" window_fps={32 / (step_ms / 1000):.2f}" if i >= 15 else "") + "\n"
+            for i in range(batches)
+        ),
+        "fps_cluster.log":
+            f"{base} cluster=intermediate_queue_0 fps=300.0 "
+            f"steady_fps={(batches - 1) * 32 / span:.3f} done={batches} "
+            f"frames={batches * 32} share=100.0%\n"
+            f"{base} SYSTEM fps=300.0 done={batches} frames={batches * 32} clusters=1\n",
+        "cut_change_ns.log": "",
+        "map_window.log": "", "map.log": "",
+    })
+
+
+def test_the_whole_span_recompute_reproduces_the_runs_own_steady_fps(
+    tmp_path: Path,
+) -> None:
+    """The check that the recipe *is* the run's: same events, same answer.
+
+    `steady_fps` is every completion after the first over the time since the
+    first, which is precisely a half-open window across the whole clock. If
+    these two disagree, the windowed throughput is measuring something the run
+    never claimed to.
+    """
+    data = runlog.read_run(write_consistent_run(tmp_path))
+    stated = data.throughput["Cluster 0"]["steady_fps"]
+    assert stated == pytest.approx(320.0)
+
+    runlog.recompute(data, (0.0, data.span_s))
+    assert data.throughput["Cluster 0"]["fps"] == pytest.approx(stated)
+    assert data.throughput["Cluster 0"]["done"] == 99
+
+
+def test_a_window_recounts_over_its_own_stretch(tmp_path: Path) -> None:
+    """20-80% of a 9.9 s run is 5.94 s, and holds 60 of the 100 batches."""
+    data = runlog.read_run(write_consistent_run(tmp_path), Window(20, 80))
+    low, high = data.window_span
+
+    assert (low, high) == pytest.approx((1.98, 7.92))
+    assert data.throughput["Cluster 0"]["done"] == 60
+    assert data.throughput["Cluster 0"]["fps"] == pytest.approx(60 * 32 / 5.94)
+    assert data.system("done") == 60
+
+
+def test_throughput_is_recounted_from_the_batches_inside_the_window(
+    run_dir: Path,
+) -> None:
+    part = runlog.read_run(run_dir, Window(20, 80))
+    low, high = part.window_span
+    size = part.batch_size
+
+    for cluster in part.clusters:
+        done = len(part.cluster_batches[cluster])
+        assert part.throughput[cluster]["done"] == done
+        assert part.throughput[cluster]["frames"] == done * size
+        assert part.throughput[cluster]["fps"] == pytest.approx(
+            done * size / (high - low)
+        )
+    # The shares still add up over the clusters that remain.
+    assert sum(part.throughput[c]["share"] for c in part.clusters) == pytest.approx(100.0)
+    # Steady state is what a window already is; a second bar meaning the same
+    # thing would be a comparison that is not in the data.
+    assert "steady_fps" not in part.throughput["Cluster 0"]
+    assert "throughput" in part.recomputed
+
+
+def test_the_window_leaves_alone_what_the_run_only_totalled(run_dir: Path) -> None:
+    """No per-batch series was written for these, so nothing can re-derive them."""
     part = runlog.read_run(run_dir, Window(20, 80))
 
-    assert part.system("fps") == 25.220
     assert part.utilization[("System", "all")]["utilization"] == 53.20
+    assert part.devices[0]["busy_s"] == 176.760
     assert part.latency[("System", "all", "e2e")]["n"] == 504
     assert part.accuracy[("Overall", "ALL")]["mAP50"] == 0.1634
+
+
+def test_windowed_accuracy_is_the_mean_of_the_windows_left_inside(
+    run_dir: Path,
+) -> None:
+    """`map.log` calls WINDOW "mean of N window(s)" — so recompute it that way."""
+    part = runlog.read_run(run_dir, Window(0, 60))
+    rows = part.accuracy_window["Cluster 0"]
+
+    assert 0 < len(rows) < 10
+    assert part.accuracy[("Cluster 0", "WINDOW")]["mAP50"] == pytest.approx(
+        sum(r["mAP50"] for r in rows) / len(rows)
+    )
+    assert "accuracy_window" in part.recomputed
+
+
+def test_a_window_past_where_a_run_scored_says_so_rather_than_going_quiet(
+    run_dir: Path,
+) -> None:
+    """mAP covers whichever batches had ground truth, which can be the start."""
+    part = runlog.read_run(run_dir, Window(90, 100))
+
+    assert part.accuracy_window["Cluster 0"] == []
+    assert ("Cluster 0", "WINDOW") not in part.accuracy      # never a stale figure
+    assert any("mAP scoring window" in w and "none are left" in w
+               for w in part.warnings)
 
 
 def test_a_cut_outside_the_window_is_dropped_rather_than_drawn_at_the_edge(
@@ -539,8 +653,9 @@ def test_a_cut_outside_the_window_is_dropped_rather_than_drawn_at_the_edge(
     Kept, its marker would be drawn at whichever edge of the axes it fell past
     and read as having happened inside the window.
     """
-    # 1.4 s in: past the first half of this run's readings, inside the second.
-    late = f"{1785127877009606331 + 1_400_000_000} intermediate_queue_0: cut 11->12 deeper\n"
+    # The run spans 1.28 s; put the change at 1.0 s, so it is inside the last
+    # half of the clock and outside the first.
+    late = f"{1785127877009606331 + 1_000_000_000} intermediate_queue_0: cut 11->12 deeper\n"
     directory = write_run(tmp_path, **{"cut_change_ns.log": late})
 
     assert len(runlog.read_run(directory).cuts) == 1
@@ -548,7 +663,9 @@ def test_a_cut_outside_the_window_is_dropped_rather_than_drawn_at_the_edge(
     assert runlog.read_run(directory, Window(0, 50)).cuts == []
 
 
-def test_windowed_charts_say_which_scope_each_one_has(run_dir: Path, tmp_path: Path) -> None:
+def test_every_chart_says_which_run_its_numbers_describe(
+    run_dir: Path, tmp_path: Path
+) -> None:
     """Both ways round: an unmarked chart would be read as windowed too."""
     charts, tiles, notes = chartmod.render(
         parsemod.parse_tree(run_dir), tmp_path / "imgs",
@@ -556,16 +673,57 @@ def test_windowed_charts_say_which_scope_each_one_has(run_dir: Path, tmp_path: P
     )
     by_id = {c.id: c for c in charts}
 
+    # Recounted from the batch events inside the span.
+    assert "recomputed over 5–90% of the run" in by_id["throughput_by_cluster"].subtitle
+    # Series, filtered to the same span.
     assert "5–90% of the run" in by_id["system_window_fps"].subtitle
-    assert "5–90% of the run" in by_id["map_by_window"].subtitle
-    assert "whole run" in by_id["throughput_by_cluster"].subtitle
-    assert "whole run" in by_id["e2e_latency_profile"].subtitle
-    # The tiles are whole-run numbers sitting above windowed charts, so they
-    # carry the scope too — and the settings from config.yaml do not.
+    assert "5–90% of the run" in by_id["cluster_window_fps"].subtitle
+    # Only a finished total was written, so it stays whole-run and says why.
+    for chart_id in ("e2e_latency_profile", "utilization_by_role",
+                     "device_utilization", "service_latency_by_role"):
+        assert "whole run" in by_id[chart_id].subtitle, chart_id
+    # One panel each way round gets its own sentence.
+    assert "matched frame by frame" in by_id["map_summary"].subtitle
+
     by_label = {t.label: t for t in tiles}
-    assert by_label["System throughput"].source.endswith("· whole run")
+    assert by_label["System throughput"].source.endswith("· 5–90%")
+    assert by_label["System utilization"].source.endswith("· whole run")
+    assert by_label["End-to-end latency"].source.endswith("· whole run")
     assert by_label["Batch size"].source == "config.yaml"
-    assert any("5–90% window" in n for n in notes)
+
+    assert any("one span for every chart" in n for n in notes)
+    assert any("still whole-run" in n for n in notes)
+
+
+def test_the_accuracy_summary_only_claims_a_windowed_mean_when_it_has_one(
+    run_dir: Path, tmp_path: Path
+) -> None:
+    """A label has to follow what is on the chart, not what was intended.
+
+    mAP scores whichever batches carried ground truth. A window holding none
+    of them leaves the all-frames figure alone on the chart, and calling that
+    "recomputed" would be the exact misreading the labels exist to stop.
+    """
+    charts, _, _ = chartmod.render(
+        parsemod.parse_tree(run_dir), tmp_path / "imgs",
+        source_dir=run_dir, window=Window(95, 100),
+    )
+    summary = next(c for c in charts if c.id == "map_summary")
+
+    assert "recomputed" not in summary.subtitle
+    assert "whole run" in summary.subtitle
+
+
+def test_a_run_with_no_clock_refuses_the_window_instead_of_guessing(
+    tmp_path: Path,
+) -> None:
+    """Without batch timestamps there is nothing to measure a span against."""
+    directory = write_run(tmp_path, **{"batch_done_ns.log": "", "fps_cluster_ns.log": ""})
+
+    data = runlog.read_run(directory, Window(5, 90))
+    assert data.window.whole                      # not applied
+    assert any("no clock" in w for w in data.warnings)
+    assert data.throughput["Cluster 0"]["fps"] == 18.131      # untouched
 
 
 def test_the_generic_path_windows_its_metrics_too(tmp_path: Path) -> None:

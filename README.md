@@ -136,23 +136,48 @@ The first batches of a run are warm-up and the last are the tail draining. Both
 drag the averages around and put a ramp on either end of every timeline, which
 is the shape of the harness rather than of the split.
 
-**⧗ Whole run** is the button that changes that. Click it and two boxes appear:
-type `5` and `90` and the report is drawn from **batches 5 to 90 of a hundred**
-— the same fixed slice on every chart. The bounds are percentages of the run, so
-they mean the same thing whether it did 100 batches or 10,000.
+**⧗ Whole run** is the button that changes that. Click it, type `5` and `95`,
+and the report describes the middle 90% of the run instead of all of it.
+
+The two numbers are percentages of **the system's own clock** — first batch
+completed to last batch completed. On a 1,340-second run, `5`–`95` is the 1,206
+seconds between 67 s and 1,273 s in. That one span cuts every chart. It is
+deliberately not a per-series slice: trimming each cluster at its own 5% mark
+would give the clusters different stretches of the run, and then comparing them
+compares two different experiments.
+
+**The numbers are recomputed, not relabelled.** Throughput is counted again
+from the batch completions inside the span — 454 batches over 1,206 s is that
+span's throughput, by the same arithmetic the run used for the whole. (The
+check that it *is* the same arithmetic: run the window across the entire clock
+and it reproduces the run's own `steady_fps` exactly.) `steady_fps` itself
+disappears from a windowed report, because a window that excluded the warm-up
+has already done that job, and a second bar meaning the same thing is a
+comparison that is not in the data.
+
+**Three things cannot be recomputed, and every chart says which side it is on:**
+
+| Stays whole-run | Because the run wrote only |
+|---|---|
+| Utilization, per device and per cluster | a cumulative `busy_s` / `total_s` |
+| Service, pipeline and end-to-end latency | finished `n` / `mean` / `p50` / `p95` / `max` |
+| Accuracy over all frames | the finished per-frame match |
+
+There is no per-batch series behind any of them, so nothing here can re-add
+them over a slice. Those charts and the stat tiles above the gallery are
+labelled **whole run**; the narrowed ones name their window. Both directions
+are marked — if only the windowed ones were, an unmarked chart would read as
+windowed too.
+
+One consequence worth knowing: mAP is only scored over frames that have ground
+truth, which can be a short stretch near the start. If your window holds none
+of those scoring windows, the accuracy charts are not drawn and the report says
+so rather than going quiet.
 
 The window is *static*: you set it before analysing, it is stored with the
 report, and re-drawing a chart later uses it again. Two analyses of one
 directory with different windows are two reports, and History marks the
-narrowed ones with `⧗5–90%`.
-
-One thing it cannot do, and every chart says which side it is on: `fps_cluster.log`,
-`latency_cluster.log`, `utilization*.log` and `map.log` each hold a single line
-that the *run itself* computed over its whole duration. Throughput, latency,
-utilization, accuracy totals and the tiles above the gallery are those numbers,
-so they keep saying **whole run** even in a windowed report. The window narrows
-what was measured batch by batch — the FPS timelines, the FPS spread, and mAP by
-window.
+narrowed ones with `⧗5–95%`.
 
 ### A chart card
 

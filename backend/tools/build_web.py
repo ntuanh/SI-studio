@@ -705,7 +705,7 @@ VISUAL_SECTION = """
                   <span class="viz-window" style="{{ viz.windowRowStyle }}">
                     <input value="{{ viz.windowStart }}" sc-camel-on-change="{{ viz.onWindowStart }}" placeholder="5" title="Where the window starts, as a percent of the run" style="__INPUT__ width:66px; text-align:right;">
                     <span class="viz-window-to">to</span>
-                    <input value="{{ viz.windowEnd }}" sc-camel-on-change="{{ viz.onWindowEnd }}" placeholder="90" title="Where the window ends, as a percent of the run" style="__INPUT__ width:66px; text-align:right;">
+                    <input value="{{ viz.windowEnd }}" sc-camel-on-change="{{ viz.onWindowEnd }}" placeholder="95" title="Where the window ends, as a percent of the run" style="__INPUT__ width:66px; text-align:right;">
                     <span class="viz-window-to">% of the run</span>
                   </span>
                 </span>
