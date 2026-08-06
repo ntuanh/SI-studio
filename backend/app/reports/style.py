@@ -327,6 +327,25 @@ def smooth_window(count: int) -> int:
     return 0 if count < 24 else max(5, min(31, count // 10 | 1))
 
 
+def stable_smooth(count: int, full: int) -> int:
+    """Smoothing width taken from the whole run, not from the slice on screen.
+
+    Two analysis windows of one run overlap, and where they overlap they hold
+    the same readings -- so they have to draw the same line. Sizing the rolling
+    mean by `len(the window's readings)` breaks that: 5-75% of a run keeps 354
+    readings and smooths over 31, 25-75% keeps 256 and smooths over 25, and the
+    two curves then disagree at the shared right-hand end where the underlying
+    readings are identical. The endpoint label disagrees with them.
+
+    So the width is chosen once from the unwindowed series and reused. A window
+    too short to carry that width falls back to its own -- an over-wide centred
+    mean flattens a short series to a horizontal line, which is worse than the
+    two curves differing at a size where there is nothing to compare anyway.
+    """
+    width = smooth_window(full or count)
+    return width if count >= width else smooth_window(count)
+
+
 def rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
     """Centred rolling mean that keeps the array length (edges use what exists)."""
     out = np.empty(len(values), dtype=float)

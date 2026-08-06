@@ -162,6 +162,10 @@ class Metric:
     name: str
     unit: str = ""
     by_source: dict[str, list[Sample]] = field(default_factory=dict)
+    #: Readings per file *before* an analysis window cut them. Smoothing widths
+    #: come from these, so two windows of one log draw the same curve where
+    #: they overlap (see `style.stable_smooth`).
+    full_counts: dict[str, int] = field(default_factory=dict)
 
     @property
     def label(self) -> str:
@@ -426,6 +430,8 @@ def apply_window(result: ParseResult, window: Window) -> ParseResult:
     summary values rather than a series, and dropping them because a narrow
     window happened to miss their line would silently delete the stat tiles.
     """
+    for metric in result.metrics.values():
+        metric.full_counts = {s: len(r) for s, r in metric.by_source.items()}
     if window.whole:
         return result
     for metric in result.metrics.values():

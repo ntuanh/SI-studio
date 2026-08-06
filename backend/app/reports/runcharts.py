@@ -46,7 +46,7 @@ from .style import (
     AXIS, INK_2, LINE_KW, MARKER_MAX, MARK_KW, MUTED, S1, S2, SURFACE,
     TINT, BAR_KW, Canvas, Chart, Shown, Tile, View, band, entity_colors, fmt,
     applied, grouped_x, headroom, label_bars, offsets, panel_legend,
-    rolling_mean, smooth_window, suptitle, takeaway, tidy,
+    rolling_mean, stable_smooth, suptitle, takeaway, tidy,
 )
 from .window import Window
 
@@ -152,7 +152,7 @@ def system_fps_timeline(canvas: Canvas, data: RunData, view: View) -> Chart | No
         return None
     x, y = _xy(points)
     mean = float(np.mean(y))
-    window = smooth_window(len(y))
+    window = stable_smooth(len(y), data.full_counts.get("system", 0))
 
     shown = Shown(view, [
         ("reading", "Reading", TINT),
@@ -230,11 +230,12 @@ def cluster_fps_timeline(canvas: Canvas, data: RunData, view: View) -> Chart | N
     colors = _cluster_colors(data)
     shown = Shown(view, [(c, c, colors.get(c, S1)) for c in available])
     series = [(r.key, available[r.key]) for r in shown]
-    smoothing = max(smooth_window(len(p)) for _, p in series)
+    smoothing = max(stable_smooth(len(p), data.full_counts.get(c, 0))
+                    for c, p in series)
 
     def draw(ax: plt.Axes, cluster: str, points: Sequence[Point], color: str) -> float:
         px, py = _xy(points)
-        win = smooth_window(len(py))
+        win = stable_smooth(len(py), data.full_counts.get(cluster, 0))
         line = rolling_mean(py, win) if win else py
         marker = dict(marker="o", **MARK_KW) if len(py) <= MARKER_MAX else {}
         ax.plot(px, line, color=color, label=cluster, **LINE_KW, **marker)

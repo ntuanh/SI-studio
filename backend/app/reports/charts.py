@@ -40,7 +40,7 @@ from .parse import apply_window as clip_parsed
 from .style import (
     AXIS, BAD, GOOD, INK, INK_2, LINE_KW, MARK_KW, MUTED, S1, SURFACE, STYLE,
     TINT, BAR_KW, Canvas, Chart, Shown, Tile, View, applied, entity_colors, fmt,
-    headroom, label_bars, rolling_mean, smooth_window, suptitle, tidy,
+    headroom, label_bars, rolling_mean, stable_smooth, suptitle, tidy,
 )
 from .window import Window
 
@@ -188,7 +188,8 @@ def _trend(canvas: Canvas, metric: Metric, view: View) -> Chart | None:
             # the raw readings drop to the pale end of that hue's ramp -- not
             # to a faded version of the slot, which would shift toward the
             # surface and break the contrast the palette was validated for.
-            window = smooth_window(len(y)) if single else 0
+            window = (stable_smooth(len(y), metric.full_counts.get(source, 0))
+                      if single else 0)
             if window:
                 ax.plot(x, y, color=TINT, label="reading", linewidth=1.4,
                         solid_capstyle="round")

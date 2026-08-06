@@ -162,6 +162,10 @@ class RunData:
     #: (seconds from the first batch) it worked out to on this run's clock.
     window: Window = field(default_factory=Window)
     window_span: tuple[float, float] | None = None
+    #: How long each series was *before* the window cut it, keyed `"system"`
+    #: and by cluster. Smoothing widths are chosen from these, so two windows
+    #: of one run draw the same curve wherever they overlap.
+    full_counts: dict[str, int] = field(default_factory=dict)
     #: Which summaries the window worked out again from the raw events, rather
     #: than inherited from the run's own totals. A chart is only labelled
     #: "recomputed" if its name is in here, so a run that did not write the
@@ -573,6 +577,11 @@ def apply_window(data: RunData, window: Window) -> RunData:
     different stretches of the run, and comparing those is the one thing the
     charts must not do.
     """
+    # Recorded whether or not a window follows, so an unwindowed report and a
+    # windowed one of the same run agree about how hard to smooth.
+    data.full_counts = {"system": len(data.system_fps)}
+    data.full_counts.update({c: len(p) for c, p in data.cluster_fps.items()})
+
     data.window = window
     if window.whole:
         return data

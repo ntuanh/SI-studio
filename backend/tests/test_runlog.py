@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from app.reports import charts as chartmod
@@ -712,6 +713,29 @@ def test_the_accuracy_summary_only_claims_a_windowed_mean_when_it_has_one(
 
     assert "recomputed" not in summary.subtitle
     assert "whole run" in summary.subtitle
+
+
+def test_two_windows_draw_the_same_line_where_they_overlap(tmp_path: Path) -> None:
+    """Same readings, same instant, same curve — whatever else was included.
+
+    The rolling mean is sized from the whole run rather than from the slice on
+    screen. Sized from the slice, 5-75% and 25-75% smoothed over different
+    widths and disagreed at the shared right-hand end, where the underlying
+    readings are identical — and the endpoint label disagreed with them.
+    """
+    from app.reports.style import rolling_mean, stable_smooth
+
+    directory = write_consistent_run(tmp_path, batches=400, step_ms=50)
+    ends = set()
+    for start in (0.0001, 5, 25, 40):
+        data = runlog.read_run(directory, Window(start, 75))
+        values = np.array([p.value for p in data.system_fps])
+        width = stable_smooth(len(values), data.full_counts.get("system", 0))
+        smoothed = rolling_mean(values, width) if width else values
+        ends.add((width, round(float(smoothed[-1]), 9),
+                  round(data.system_fps[-1].at, 9)))
+
+    assert len(ends) == 1, ends
 
 
 def test_a_run_with_no_clock_refuses_the_window_instead_of_guessing(
