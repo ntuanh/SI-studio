@@ -780,3 +780,284 @@ def test_a_windowed_run_still_reads_a_single_stated_value(tmp_path: Path) -> Non
         parsemod.parse_tree(source), tmp_path / "imgs", window=Window(90, 95)
     )
     assert [t.label for t in tiles] == ["Peak memory"]
+
+
+# ------------------------------------------------- the optional measurements
+# Two all-or-nothing features a run either measures or does not: free time
+# (§2.10-2.12) and the queue host's RAM (§2.13-2.14). The base fixture measures
+# neither, which is why they live here rather than in `RESULT_FILES` -- a run
+# without them must keep drawing the first ten charts and saying nothing about
+# the absence.
+
+# The clients are `utilization.log`'s own, so the two measures of one device
+# can be put side by side. `ccc` and `ddd` use the right-aligned form §3.8
+# prints -- `free_s= 27.222`, a space after the `=`.
+FREE_TIME = """\
+1785128504880000000 client=aaa role=edge  machine=machine-2 cluster=intermediate_queue_0 device=cpu  span_s=467.394 busy_s=181.004 free_s=286.390 free=61.28% gaps=57 longest_free_ms=9821.400 host_idle=54.10%
+1785128504880000000 client=bbb role=edge  machine=machine-2 cluster=intermediate_queue_0 device=cpu  span_s=470.000 busy_s=397.620 free_s= 72.380 free=15.40% gaps=44 longest_free_ms=7210.000 host_idle=54.10%
+1785128504880000000 client=ccc role=cloud machine=machine-7 cluster=intermediate_queue_0 device=cuda span_s=599.152 busy_s=571.930 free_s= 27.222 free= 4.54% gaps=170 longest_free_ms=812.100 host_idle=11.30%
+1785128504880000000 client=ddd role=cloud machine=machine-8 cluster=intermediate_queue_1 device=cuda span_s=588.400 busy_s=512.300 free_s= 76.100 free=12.93% gaps=140 longest_free_ms=990.000 host_idle=18.70%
+"""
+
+# All six line kinds. The FREE shares sum to exactly 100%; the KIND shares sum
+# to 105.3%, which is correct rather than a rounding slip -- lanes overlap.
+FREE_TIME_CLUSTER = """\
+1785128504880000000 cluster=intermediate_queue_0 ALL devices=3 free=25.09% free_mean=27.07% free_s=385.992 span_s=1536.546
+1785128504880000000 cluster=intermediate_queue_0 role=edge devices=2 free=38.27% free_s=358.770 span_s=937.394
+1785128504880000000 cluster=intermediate_queue_0 role=cloud devices=1 free=4.54% free_s=27.222 span_s=599.152
+1785128504880000000 cluster=intermediate_queue_1 ALL devices=1 free=12.93% free_mean=12.93% free_s=76.100 span_s=588.400
+1785128504880000000 SYSTEM FREE reason=input free_s=300.200 share=64.98%
+1785128504880000000 SYSTEM FREE reason=backpressure free_s=104.550 share=22.63%
+1785128504880000000 SYSTEM FREE reason=unaccounted free_s=57.242 share=12.39%
+1785128504880000000 SYSTEM KIND kind=inference busy_s=900.000 share=42.30%
+1785128504880000000 SYSTEM KIND kind=recv busy_s=700.000 share=32.90%
+1785128504880000000 SYSTEM KIND kind=send busy_s=640.000 share=30.10%
+1785128504880000000 MACHINE machine=machine-2 devices=2 free=31.40% free_s=147.200 span_s=469.000 merge_slop_s=0.000 host_idle=54.10%
+1785128504880000000 MACHINE machine=machine-7 devices=1 free=4.54% free_s=27.222 span_s=599.152 merge_slop_s=0.180 host_idle=11.30%
+1785128504880000000 MACHINE machine=machine-8 devices=1 free=12.93% free_s=76.100 span_s=588.400 merge_slop_s=0.000 host_idle=18.70%
+1785128504880000000 MACHINE machine=machine-1 devices=0 host_idle=88.40%
+1785128504880000000 SYSTEM devices=4 clusters=2 machines=4 free=21.73% free_mean=23.54% free_s=461.992 span_s=2124.946
+"""
+
+# `t_offset_s` is the device's own clock, and the two devices deliberately do
+# not start together.
+FREE_TIME_SERIES = "\n".join(
+    f"1785128504880000000 client={client} role={role} machine=machine-2 "
+    f"cluster=intermediate_queue_0 i={i} t_offset_s={i * 5.0:.3f} "
+    f"bucket_s=5.000 free={10 + (i * 13 + seed) % 80}.40%"
+    for seed, (client, role) in enumerate((("aaa", "edge"), ("ccc", "cloud")))
+    for i in range(8)
+) + "\n"
+
+# Sixteen samples at 80 ms, on the run's clock, so a window can cut them.
+BROKER_RAM_NS = "\n".join(
+    f"{1785127877009606331 + i * 80_000_000} host=192.168.101.91 source=ssh "
+    f"total_mb=5921.5 used_mb={1180 + i * 40}.2 used={(1180 + i * 40) / 59.215:.2f}% "
+    f"avail_mb={5921.5 - 1180 - i * 40:.1f} free_mb=3770.5 cached_mb=747.0 "
+    f"swap_used_mb=1032.3 rabbit_rss_mb={78 + i * 9}.8"
+    for i in range(16)
+) + "\n"
+
+BROKER_RAM = """\
+1785128504880000000 BROKER host=192.168.101.91 source=ssh samples=16 interval_s=0.080 span_s=1.280 total_mb=5921.5 t_start_ns=1785127877009606331 t_end_ns=1785127878209606331
+1785128504880000000 USED   min_mb=1180.2 mean_mb=1480.2 p50_mb=1500.2 p95_mb=1780.2 max_mb=1780.2 min=19.93% mean=25.00% p50=25.34% p95=30.06% max=30.06%
+1785128504880000000 DELTA  start_mb=1180.2 end_mb=1780.2 growth_mb=600.0 peak_over_start_mb=600.0
+1785128504880000000 RABBIT mean_rss_mb=145.3 max_rss_mb=213.8 swap_max_mb=1032.3
+"""
+
+# `pipeline` carries the hand-off queue waits `service` does not, so it is the
+# same devices measured over a longer span -- never a second reading of one.
+LATENCY_WITH_PIPELINE = LATENCY_CLUSTER + """\
+1785128504874248492 cluster=intermediate_queue_0 role=cloud kind=pipeline n=336 mean_ms=16664.165 p50_ms=17354.610 p95_ms=19831.230 max_ms=21839.705
+1785128504874248492 cluster=intermediate_queue_0 role=edge kind=pipeline n=336 mean_ms=342.576 p50_ms=336.640 p95_ms=409.440 max_ms=481.920
+"""
+
+EXTRA_FILES = {
+    "free_time.log": FREE_TIME,
+    "free_time_cluster.log": FREE_TIME_CLUSTER,
+    "free_time_series.log": FREE_TIME_SERIES,
+    "broker_ram_ns.log": BROKER_RAM_NS,
+    "broker_ram.log": BROKER_RAM,
+    "latency_cluster.log": LATENCY_WITH_PIPELINE,
+}
+
+
+@pytest.fixture()
+def full_run(tmp_path: Path) -> Path:
+    return write_run(tmp_path, **EXTRA_FILES)
+
+
+def test_a_padded_value_is_still_read(full_run: Path) -> None:
+    """§3.8 prints `free_s= 27.222` — the grammar says no spaces, the file has them.
+
+    Without the tolerance those two keys simply do not match, and the chart
+    would be drawn from whichever devices happened to have numbers wide enough
+    not to need padding.
+    """
+    cloud = next(d for d in runlog.read_run(full_run).free_devices
+                 if d["client"] == "ccc")
+
+    assert cloud["free_s"] == 27.222
+    assert cloud["free"] == 4.54
+
+
+def test_free_time_reads_all_six_line_kinds(full_run: Path) -> None:
+    """§3.9: a `FREE reason=` line also carries `cluster=`, so flags come first."""
+    data = runlog.read_run(full_run)
+
+    assert len(data.free_devices) == 4
+    assert data.free_time[("System", "all")]["free"] == 21.73
+    assert data.free_time[("Cluster 0", "edge")]["free"] == 38.27
+    assert data.free_reasons[("System", "input")]["free_s"] == 300.200
+    assert data.free_kinds[("System", "inference")]["busy_s"] == 900.000
+    assert [m["machine"] for m in data.machines] == [
+        "machine-2", "machine-7", "machine-8", "machine-1",
+    ]
+    # The breakdown lines must not have been filed as their cluster's total.
+    assert ("System", "all") in data.free_time
+    assert data.free_time[("System", "all")]["devices"] == 4
+
+
+def test_free_reasons_are_exclusive_and_busy_kinds_are_not(full_run: Path) -> None:
+    """The two breakdowns obey different arithmetic, which is why they are two panels."""
+    data = runlog.read_run(full_run)
+    reasons = [v["share"] for (scope, _), v in data.free_reasons.items()
+               if scope == "System"]
+    kinds = [v["share"] for (scope, _), v in data.free_kinds.items()
+             if scope == "System"]
+
+    assert sum(reasons) == pytest.approx(100.0, abs=0.05)
+    assert sum(kinds) > 100.0        # lanes overlap; only merged busy is exclusive
+
+
+def test_the_free_series_keeps_each_devices_own_clock(full_run: Path) -> None:
+    """`t_offset_s` is not the server's clock and is never shifted onto it."""
+    data = runlog.read_run(full_run)
+
+    assert sorted(data.free_series) == ["aaa", "ccc"]
+    assert [p.at for p in data.free_series["aaa"]] == [i * 5.0 for i in range(8)]
+    assert data.free_series_meta["ccc"]["role"] == "cloud"
+    assert data.free_series_meta["ccc"]["bucket_s"] == "5.000"
+
+
+def test_the_broker_series_lands_on_the_runs_clock(full_run: Path) -> None:
+    """Sampled by the server, so it shares the batch completions' x axis."""
+    data = runlog.read_run(full_run)
+
+    assert data.broker_source == "ssh"
+    assert data.broker_host == "192.168.101.91"
+    assert len(data.broker_samples) == 16
+    assert data.broker_samples[0]["at"] == 0.0        # the first DONE is t=0
+    assert data.broker_samples[-1]["at"] == pytest.approx(1.2)
+    assert data.broker_samples[0]["rss_mb"] == 78.8   # `rabbit_rss_mb`, by suffix
+    assert data.broker["DELTA"]["growth_mb"] == 600.0
+    assert data.broker["BROKER"]["samples"] == 16
+
+
+def test_no_samples_says_why_rather_than_going_quiet(tmp_path: Path) -> None:
+    """A missing figure and a healthy host look identical; `(reason)` does not."""
+    directory = write_run(tmp_path, **{
+        **EXTRA_FILES,
+        "broker_ram_ns.log": "\n",
+        "broker_ram.log": "1785128504880000000 BROKER host=192.168.101.91 "
+                          "source=ssh samples=0 (permission denied)\n",
+    })
+    data = runlog.read_run(directory)
+
+    assert data.broker_note == "permission denied"
+    assert any("permission denied" in w and "not a report that the host was fine" in w
+               for w in data.warnings)
+
+    charts, _, notes = render(directory, tmp_path / "imgs")
+    assert not any(c.id.startswith("broker_ram") for c in charts)
+    assert any("permission denied" in n for n in notes)
+
+
+def test_the_optional_files_are_not_missed_when_a_run_skips_them(run_dir: Path) -> None:
+    """A run measures free time or it does not — absence is not a fault to report."""
+    data = runlog.read_run(run_dir)
+
+    assert not data.free_devices and not data.broker_samples
+    assert not any("free_time" in w or "broker_ram" in w for w in data.warnings)
+
+
+def test_the_diagnostics_are_drawn_when_the_run_measured_them(
+    full_run: Path, tmp_path: Path
+) -> None:
+    """01-10 are the story; 11-17 are what the optional files add to it."""
+    charts, _, _ = render(full_run, tmp_path / "imgs")
+    by_id = {c.id: c for c in charts}
+
+    assert [c.id for c in charts][10:] == [
+        "queue_wait", "device_free_time", "free_time_breakdown",
+        "machine_free_time", "free_time_series", "broker_ram_timeline",
+        "broker_ram_profile",
+    ]
+    assert by_id["queue_wait"].file.startswith("11_")
+    assert by_id["broker_ram_profile"].file.startswith("17_")
+    assert all((tmp_path / "imgs" / c.file).is_file() for c in charts)
+    # Every one of them offers something to switch off, and says what it is.
+    assert all(c.series and all(s.label for s in c.series) for c in charts)
+    json.dumps([c.to_dict() for c in charts])
+
+
+def test_free_time_is_never_presented_as_the_complement_of_utilization(
+    full_run: Path, tmp_path: Path
+) -> None:
+    """They measure different things over different scopes (§2.10).
+
+    Drawn side by side precisely because the gap is the finding — so the card
+    has to say, in words, that they are not two halves of one number.
+    """
+    charts, _, _ = render(full_run, tmp_path / "imgs")
+    chart = next(c for c in charts if c.id == "device_free_time")
+
+    assert "≠ 100%" in chart.subtitle
+    assert [s.key for s in chart.series] == ["free", "utilization"]
+
+
+def test_the_pipeline_chart_needs_the_second_measure(tmp_path: Path) -> None:
+    """Without `kind=pipeline` it would repeat chart 05 and say nothing new."""
+    without = write_run(tmp_path, **{k: v for k, v in EXTRA_FILES.items()
+                                     if k != "latency_cluster.log"})
+
+    charts, _, _ = render(without, tmp_path / "imgs")
+    assert not any(c.id == "queue_wait" for c in charts)
+    # …and the gap it would have used stays a gap, so 12 keeps meaning 12.
+    assert next(c for c in charts if c.id == "device_free_time").file.startswith("12_")
+
+
+def test_the_free_time_series_refuses_the_window_and_says_which_clock(
+    full_run: Path, tmp_path: Path
+) -> None:
+    """Its offsets are each device's own; the window is a span of the system's.
+
+    "Whole run" alone would read as "the run only wrote a total", which is the
+    wrong reason and invites someone to go and fix it.
+    """
+    data = runlog.read_run(full_run, Window(5, 90))
+    assert [p.at for p in data.free_series["aaa"]] == [i * 5.0 for i in range(8)]
+
+    charts, _, notes = chartmod.render(
+        parsemod.parse_tree(full_run), tmp_path / "imgs",
+        source_dir=full_run, window=Window(5, 90),
+    )
+    by_id = {c.id: c for c in charts}
+    assert "own clock" in by_id["free_time_series"].subtitle
+    assert "whole run" in by_id["device_free_time"].subtitle
+    assert any("device's own clock" in n for n in notes)
+
+
+def test_the_broker_series_is_cut_to_the_window(full_run: Path) -> None:
+    """It is on the server's clock, so it is a series like any other."""
+    part = runlog.read_run(full_run, Window(50, 100))
+
+    assert 0 < len(part.broker_samples) < 16
+    assert all(s["at"] > 0.6 for s in part.broker_samples)
+    # The shutdown summary is still one finished total and stays whole-run.
+    assert part.broker["USED"]["max_mb"] == 1780.2
+
+
+def test_the_windowed_broker_chart_says_it_is_windowed(
+    full_run: Path, tmp_path: Path
+) -> None:
+    charts, _, _ = chartmod.render(
+        parsemod.parse_tree(full_run), tmp_path / "imgs",
+        source_dir=full_run, window=Window(5, 90),
+    )
+    by_id = {c.id: c for c in charts}
+
+    assert "5–90% of the run" in by_id["broker_ram_timeline"].subtitle
+    assert "whole run" in by_id["broker_ram_profile"].subtitle
+
+
+def test_the_optional_tiles_carry_their_source_and_their_alarm(full_run: Path) -> None:
+    """A RAM figure without its source is a plausible number meaning something else."""
+    by_label = {t.label: t for t in runcharts.tiles(runlog.read_run(full_run))}
+
+    assert by_label["Fleet free time"].value == "21.7"
+    assert by_label["Queue-host RAM peak"].value == "1,780"
+    assert "source=ssh" in by_label["Queue-host RAM peak"].source
+    # Swap was held, so the tile is flagged — and says why, never color alone.
+    assert by_label["Queue-host RAM peak"].delta_kind == "bad"
+    assert "swap" in by_label["Queue-host RAM peak"].delta

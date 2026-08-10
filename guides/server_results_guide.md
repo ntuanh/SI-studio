@@ -45,19 +45,32 @@ Two properties hold for every file below:
 
 ---
 
-## 2. The nine result files
+## 2. The result files
 
-| File | Written by | When | Granularity |
-|---|---|---|---|
-| `batch_done_ns.log` | `on_fps` | live | one line per finished batch |
-| `fps_cluster_ns.log` | `on_fps` | live | one line per finished batch, cluster-tagged |
-| `fps_cluster.log` | `_report_cluster_fps` | shutdown | one line per cluster + `SYSTEM` |
-| `utilization.log` | `_collect_utilization` | shutdown | one line per device |
-| `utilization_cluster.log` | `_report_cluster_util_latency` | shutdown | per cluster, per cluster/role, + `SYSTEM` |
-| `latency_cluster.log` | `_report_cluster_util_latency` | shutdown | per cluster/role (service) + per cluster (e2e) + `SYSTEM` |
-| `map_window.log` | `_map_pipeline_window` | shutdown | one line per sliding window |
-| `map.log` | `_collect_map_pred` | shutdown | 2 lines per cluster + 2 `OVERALL` |
-| `cut_change_ns.log` | `_broadcast_setcut` | live | one line per cut change (adaptive only) |
+Nine every run writes, plus five a run writes only when it measured the thing.
+
+| File | Written by | When | Granularity | Always |
+|---|---|---|---|---|
+| `batch_done_ns.log` | `on_fps` | live | one line per finished batch | yes |
+| `fps_cluster_ns.log` | `on_fps` | live | one line per finished batch, cluster-tagged | yes |
+| `fps_cluster.log` | `_report_cluster_fps` | shutdown | one line per cluster + `SYSTEM` | yes |
+| `utilization.log` | `_collect_utilization` | shutdown | one line per device | yes |
+| `utilization_cluster.log` | `_report_cluster_util_latency` | shutdown | per cluster, per cluster/role, + `SYSTEM` | yes |
+| `latency_cluster.log` | `_report_cluster_util_latency` | shutdown | per cluster/role (service, pipeline) + per cluster (e2e) + `SYSTEM` | yes |
+| `map_window.log` | `_map_pipeline_window` | shutdown | one line per sliding window | yes |
+| `map.log` | `_collect_map_pred` | shutdown | 2 lines per cluster + 2 `OVERALL` | yes |
+| `cut_change_ns.log` | `_broadcast_setcut` | live | one line per cut change (adaptive only) | yes |
+| `free_time.log` | free-time collector | shutdown | one line per device | optional |
+| `free_time_cluster.log` | free-time collector | shutdown | per cluster, per cluster/role, per machine, + `SYSTEM` | optional |
+| `free_time_series.log` | free-time collector | shutdown | one line per device per time bucket | optional |
+| `broker_ram_ns.log` | the RAM sampler | live | one line per sample of the queue host | optional |
+| `broker_ram.log` | the RAM sampler | shutdown | `BROKER` / `USED` / `DELTA` / `RABBIT` | optional |
+
+**The two optional features are all-or-nothing.** `free_time*` is one feature of three files
+(§2.10–2.12) and `broker_ram*` is one feature of two (§2.13–2.14) — a run emits all of a
+feature's files or none of them. Absence means "this run did not measure it", which is not a
+fault and is not warned about; what *is* worth reporting is an attempt that failed, and §2.14
+has a line kind for exactly that.
 
 ### 2.1 `batch_done_ns.log` — system throughput series
 
@@ -168,7 +181,15 @@ Written alongside the file above, from pooled raw samples shipped by the devices
 | `kind` | Span | Clock |
 |---|---|---|
 | `service` | that device's own `get_input → output`, reported per role | one clock — exact |
+| `pipeline` | the same unit from ready to published, **including hand-off queue waits**, per role | one clock — exact |
 | `e2e` | edge batch start → completing tier's output, one series per cluster | two machines — inherits any clock offset between them |
+
+`service` samples sum to the matching `busy_s` in `utilization_cluster.log`, which makes it the
+only latency directly comparable against utilization. `pipeline` adds the in-process queue
+waits, so it scales with **queue depth** rather than with device speed — a run at depth 4
+measured `service ≈ 11.6 s` against `pipeline ≈ 57.6 s` on the same hardware. When `pipeline ≫
+service` the fix is a shorter queue, and throughput does not depend on it. `role=` is absent on
+`e2e` and `SYSTEM` lines.
 
 Percentiles are **nearest-rank over the sorted pooled samples** (no interpolation), so every
 number printed is a latency that was actually observed. Devices ship raw samples rather than
@@ -239,6 +260,148 @@ takes more (cloud was starved).
 > earlier dynamic run's file in place — and `_archive_results` copies any non-empty result file,
 > so a `split`-tagged archive can end up carrying a stale `cut_change_ns.log`. Ignore that file
 > in any archive whose tag is not `dynamic`.
+
+### 2.10 `free_time.log` — per-device idle time (optional)
+
+One line per device, drained at shutdown like `utilization.log`. **Free time is the wall clock in
+which the device did nothing at all** — no input, no compute, no encode/decode, no transfer, no
+bookkeeping — computed as the run span minus the **union** of every one of its lanes' busy
+intervals.
+
+```
+1786024095544125400 client=7e3dd352-8b9a-4d6b-8173-412705d9bbe3 role=edge  machine=machine-2 cluster=intermediate_queue_0 device=cpu  span_s=467.394 busy_s=181.004 free_s=286.390 free=61.28% gaps=57 longest_free_ms=9821.400 host_idle=54.10%
+1786024095544125400 client=c6fdabe4-63e1-45f7-ad21-ef4de628bd3b role=cloud machine=machine-7 cluster=intermediate_queue_0 device=cuda span_s=599.152 busy_s=571.930 free_s= 27.222 free= 4.54% gaps=170 longest_free_ms=812.100 host_idle=11.30%
+```
+
+| Field | Meaning |
+|---|---|
+| col 1 | ns-epoch **arrival** of the report (not a device timestamp) |
+| `machine` | the host this device process runs on — several devices may share one |
+| `span_s` / `busy_s` / `free_s` | `busy_s` is the **merged** intervals; `busy_s + free_s == span_s` exactly |
+| `free` | `free_s / span_s`, ≤ 100% |
+| `gaps` / `longest_free_ms` | how many separate idle stretches, and the longest |
+| `host_idle` | the OS's own idle share for the whole machine, across all processes. Optional |
+
+> **`free` and `utilization` (§2.4) are not complements.** Utilization is `busy/total` over one
+> lane's `get input → output` window; free time is every lane over the whole run. A wait *inside*
+> the unit window counts as busy for one and free for the other, and work on a second lane counts
+> for the other and not at all for the first. **`free% + utilization% ≠ 100%`, and neither can be
+> derived from the other.** A device at 40% utilization and 3% free is not idle — it is doing work
+> the unit window never saw, and that gap is the finding.
+
+> **Values may be right-aligned.** `free_s= 27.222` has a space after the `=`, which the universal
+> grammar in §1 does not allow. Readers here tolerate it; a parser that does not silently drops
+> every padded key and charts only the devices whose numbers happened to be wide.
+
+### 2.11 `free_time_cluster.log` — free time rolled up (optional)
+
+Six line kinds in one file. They are told apart by their **flag** before their keys: a `FREE`
+line also carries `cluster=`, so reading the scope first files every breakdown as a cluster total.
+
+```
+1786024095544125400 cluster=intermediate_queue_0 ALL devices=8 free=48.21% free_mean=46.02% free_s=2055.900 span_s=4264.621
+1786024095544125400 cluster=intermediate_queue_0 role=edge devices=6 free=61.28% free_mean=60.11% free_s=1719.200 span_s=2805.700
+1786024095544125400 SYSTEM FREE reason=input free_s=1802.400 share=87.67%
+1786024095544125400 SYSTEM KIND kind=inference busy_s=1204.700 share=28.25%
+1786024095544125400 MACHINE machine=machine-2 devices=3 free=12.40% free_s=57.900 span_s=467.394 merge_slop_s=0.000 host_idle=54.10%
+1786024095544125400 SYSTEM devices=12 clusters=2 machines=12 free=39.55% free_mean=38.10% free_s=2643.700 span_s=6684.796
+```
+
+| Line kind | Marked by | Covers |
+|---|---|---|
+| cluster total | `cluster=` + `ALL` | every device in that cluster |
+| cluster × role | `cluster=` + `role=` | devices of one role in one cluster |
+| free breakdown | `FREE` + `reason=` | why that scope was free |
+| busy breakdown | `KIND` + `kind=` | where that scope's busy time went |
+| machine | `MACHINE` + `machine=` | every device **process** on one host |
+| system | `SYSTEM` | every device |
+
+- `free` is **pooled** (`Σfree / Σspan`); `free_mean` is the plain mean of per-device percentages,
+  on `ALL`/`SYSTEM` only. The same pair, and the same reading, as §2.5.
+- **`FREE reason=` shares sum to exactly 100%** of that scope's free time. Overlapping reasons are
+  attributed in a fixed priority so nothing is double counted, and whatever no reason covers is
+  reported as `unaccounted` rather than dropped.
+- **`KIND kind=` shares may sum to more than 100%.** Per-kind sums overlap across lanes by
+  construction; only the merged `busy_s` in §2.10 is exclusive. This is correct output, not a bug.
+- `MACHINE` lines come from the **union of the busy intervals** of the processes on that host,
+  never from their ratios: two processes each 50% free can keep a machine 100% busy by
+  interleaving. Intervals are never unioned across machines — that is the one place device
+  timestamps are compared, and it is valid only because processes on one host share a clock.
+- `merge_slop_s` is non-busy time swallowed by capping the shipped interval list. It biases the
+  answer toward *less* free time, which is the safe direction, and states its own error bar.
+- A machine running no devices (the controller's own host) may appear with `devices=0` and only
+  `host_idle`. It is still part of the fleet.
+
+`free` against `host_idle` is a four-way read: both high is spare capacity; free-high with
+idle-low means something else on the box is eating the CPU; free-low with idle-high means the
+pipeline is blocked on I/O rather than compute; both low is saturated.
+
+### 2.12 `free_time_series.log` — free time over the run (optional)
+
+One line per device per fixed-width bucket. Written at shutdown, but describes the whole run.
+
+```
+1786024095544125400 client=7e3dd352 role=edge machine=machine-2 cluster=intermediate_queue_0 i=0 t_offset_s=0.000 bucket_s=1.000 free=12.40%
+```
+
+- The leading timestamp is the report's server-clock **arrival**, exactly as in §2.4. The position
+  in the run is carried by `t_offset_s`, which is on the **device's own** clock.
+- **Do not conflate them.** Devices start at different moments, so two rows with the same offset
+  are not the same instant, and this series cannot be cut on a window of the system's clock.
+- `bucket_s` is on every line rather than assumed, so a long run may widen its buckets without
+  breaking a reader.
+
+### 2.13 `broker_ram_ns.log` — the queue host's RAM, sampled (optional)
+
+The one measurement not reported by a process we wrote. The machine hosting the message queue runs
+only third-party infrastructure, is on the critical path anyway, and when it is the bottleneck
+**every symptom shows up somewhere else**: a broker at its high-water mark does not fail, it blocks
+publishers, and on the worker that looks like a stall with no local cause. *The next stage is slow*
+and *the broker stopped accepting* produce almost identical worker-side telemetry — this file is
+what separates them. The server samples it over one long-lived SSH session, live-appended so a run
+that dies still leaves the series behind.
+
+```
+1786282738811691751 host=192.168.101.91 source=ssh total_mb=5921.5 used_mb=1586.2 used=26.79% avail_mb=4335.3 free_mb=3770.5 cached_mb=747.0 swap_used_mb=1032.3 rabbit_rss_mb=87.8
+```
+
+- `used_mb` is **`MemTotal − MemAvailable`**. `MemTotal − MemFree` counts reclaimable page cache as
+  used and reads ~90% on any machine that has touched a disk — always alarming, never actionable.
+- **`source=` is part of the number.** `ssh` is host memory across every process on the box;
+  `rabbitmq_api` is the management-API fallback, where `used_mb` is the **broker process**, not the
+  host. They answer different questions and are never silently substituted: an unlabelled fallback
+  produces a plausible number meaning something other than what the file name says.
+- `rabbit_rss_mb` answers *is it full because of the thing I care about*, which has a different fix
+  from *is the box full*. `swap_used_mb` matters because a host that is swapping is already past
+  the point where its latency contribution is stable.
+- Sampling starts where work is dispatched, so the first sample is the baseline with every queue
+  empty, and stops after the shutdown drain — a curve that does **not** fall there is the signal
+  that something is still holding units.
+
+### 2.14 `broker_ram.log` — the RAM summary (optional)
+
+Four flagged lines at shutdown.
+
+```
+1786282740000000000 BROKER host=192.168.101.91 source=ssh samples=1187 interval_s=1.000 span_s=1186.4 total_mb=5921.5 t_start_ns=… t_end_ns=…
+1786282740000000000 USED   min_mb=… mean_mb=… p50_mb=… p95_mb=… max_mb=… min=…% mean=…% p95=…% max=…%
+1786282740000000000 DELTA  start_mb=… end_mb=… growth_mb=… peak_over_start_mb=…
+1786282740000000000 RABBIT mean_rss_mb=… max_rss_mb=… swap_max_mb=…
+```
+
+Percentiles are **nearest-rank over the raw samples**, no interpolation — the same rule as §2.6, so
+every number printed is a value that was actually observed.
+
+Read it in this order: `DELTA growth_mb` (did the run leak? positive growth across a run that
+drained completely means units are still buffered somewhere) → `DELTA peak_over_start_mb` (the real
+headroom question — compare against `unit_size × max_queue_depth`) → `USED max` against `total_mb`
+(how close to the wall) → `RABBIT max_rss_mb` (the broker, or something else on the box) →
+`swap_max_mb` (non-zero invalidates any latency conclusion drawn from the same run).
+
+> **`samples=0` is a result.** When sampling never happened the `BROKER` line is still written,
+> with the reason in trailing parentheses: `samples=0 (permission denied)`. A missing file is
+> indistinguishable from a run where the host was fine; that line is not, and it is surfaced as a
+> report warning rather than as a chart that quietly did not draw.
 
 ---
 

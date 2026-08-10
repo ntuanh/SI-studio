@@ -14,7 +14,17 @@ order:
 | `utilization.log` | 08 per-device utilization (C8) |
 | `map_window.log` | 09 accuracy by window (C9) |
 | `map.log` | 10 accuracy summary (C10) |
+| `latency_cluster.log` | 11 pipeline against service — the queue wait |
+| `free_time.log` | 12 free time against utilization, per device |
+| `free_time_cluster.log` | 13 why it was free / where the busy went, 14 per machine |
+| `free_time_series.log` | 15 free time over the run |
+| `broker_ram_ns.log` | 16 the queue host's RAM against throughput |
+| `broker_ram.log` | 17 the RAM profile and what the run added |
 | *(derived)* | the stat tiles (C12) |
+
+01-10 are the story every run tells. 11-17 are the diagnostics: one latency
+comparison the first ten do not draw, and the two optional features
+(§2.10-2.14) a run either measures or does not.
 
 Chart numbers are fixed rather than sequential. A run with no `map.log` leaves
 the 09/10 gap instead of renumbering, so a note saved against "07" keeps
@@ -39,11 +49,12 @@ from typing import Callable, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import LinearSegmentedColormap
 
 from . import palette as pal
-from .runlog import OVERALL, SYSTEM, WHOLE_RUN_ONLY, Point, RunData
+from .runlog import OVERALL, SYSTEM, WHOLE_RUN_ONLY, Point, RunData, num
 from .style import (
-    AXIS, INK_2, LINE_KW, MARKER_MAX, MARK_KW, MUTED, S1, S2, SURFACE,
+    AXIS, INK_2, LINE_KW, MARKER_MAX, MARK_KW, MUTED, S1, S2, S3, SURFACE,
     TINT, BAR_KW, Canvas, Chart, Shown, Tile, View, band, entity_colors, fmt,
     applied, grouped_x, headroom, label_bars, offsets, panel_legend,
     rolling_mean, stable_smooth, suptitle, takeaway, tidy,
@@ -68,6 +79,21 @@ def _cluster_colors(data: RunData) -> dict[str, str]:
 def _xy(points: Sequence[Point]) -> tuple[np.ndarray, np.ndarray]:
     return (np.array([p.at for p in points], dtype=float),
             np.array([p.value for p in points], dtype=float))
+
+
+def _role_ticks(devices: Sequence[dict[str, object]]) -> list[str]:
+    """`C1 C2 E1 E2` — numbered WITHIN each role.
+
+    A running counter gives `C1 C2 E3 E4`, which reads as two missing devices
+    (§C8).
+    """
+    seen: dict[str, int] = {}
+    ticks: list[str] = []
+    for device in devices:
+        role = str(device["role"])
+        seen[role] = seen.get(role, 0) + 1
+        ticks.append(f"{role[:1].upper()}{seen[role]}")
+    return ticks
 
 
 def _endpoint(ax: plt.Axes, x: float, y: float, color: str, text: str) -> None:
@@ -535,14 +561,7 @@ def device_utilization(canvas: Canvas, data: RunData, view: View) -> Chart | Non
     values = [float(d["utilization"]) for d in devices]
     colors = [ROLE_COLOR.get(str(d["role"]), MUTED) for d in devices]
 
-    # Number WITHIN each role: a running counter gives `C1 C2 E3 E4`, which
-    # reads as two missing devices (§C8).
-    seen: dict[str, int] = {}
-    ticks = []
-    for d in devices:
-        role = str(d["role"])
-        seen[role] = seen.get(role, 0) + 1
-        ticks.append(f"{role[:1].upper()}{seen[role]}")
+    ticks = _role_ticks(devices)
 
     fig, ax = plt.subplots(figsize=(max(7.0, 0.62 * len(devices) + 2.6), 4.2))
     x = np.arange(len(devices), dtype=float)
@@ -693,6 +712,625 @@ def accuracy_summary(canvas: Canvas, data: RunData, view: View) -> Chart | None:
         view, title=title, ylabel="mAP@50", shown=shown), index=10)
 
 
+# --------------------------------------------------------- 11 · queue wait
+def queue_wait(canvas: Canvas, data: RunData, view: View) -> Chart | None:
+    """Service beside pipeline. The gap between them is buffering, not devices.
+
+    `service` is the device's own `get input -> output`; `pipeline` is the same
+    unit from ready to published, so it additionally carries the in-process
+    hand-off queue waits. It therefore scales with queue depth rather than with
+    device speed -- a run at depth 4 measured 11.6 s service against 57.6 s
+    pipeline on the same hardware. When the second bar towers over the first,
+    the fix is a shorter queue, and throughput does not depend on it (§2.6).
+    """
+    pairs: dict[tuple[str, str], dict[str, dict[str, float]]] = {}
+    for (scope, role, kind), stats in data.latency.items():
+        if kind in ("service", "pipeline"):
+            pairs.setdefault((scope, role), {})[kind] = stats
+    # Only worth a chart when the run wrote the second measure: one bar per
+    # cluster repeated from chart 05 says nothing chart 05 did not.
+    if not any("pipeline" in kinds for kinds in pairs.values()):
+        return None
+
+    roles = [r for r in data.roles if any(role == r for _, role in pairs)]
+    scopes = [s for s in data.clusters if any(scope == s for scope, _ in pairs)]
+    if not roles or not scopes:
+        return None
+
+    shown = Shown(view, [("service", "Service", S1), ("pipeline", "Pipeline", S2)])
+    every = [pairs.get((s, r), {}).get(k.key, {}).get("mean_ms", math.nan)
+             for s in scopes for r in roles for k in shown]
+    to_seconds = max((v for v in every if math.isfinite(v)), default=0.0) >= 2000
+    scale, unit = (1000.0, "s") if to_seconds else (1.0, "ms")
+
+    x = np.arange(len(scopes), dtype=float)
+    off = offsets(len(shown), WIDTH)
+    # Cloud service time runs an order of magnitude above the edge, so this is
+    # the same two-honest-scales panel split chart 05 uses, for the same reason.
+    fig, axes = plt.subplots(1, len(roles), figsize=(5.6 * len(roles), 4.3),
+                             squeeze=False)
+    for ax, role in zip(axes[0], roles):
+        heights: list[float] = []
+        for i, ref in enumerate(shown):
+            values = [pairs.get((s, role), {}).get(ref.key, {}).get("mean_ms", math.nan)
+                      / scale for s in scopes]
+            heights.extend(values)
+            bars = ax.bar(x + off[i], values, WIDTH, label=ref.label,
+                          color=ref.color, **BAR_KW)
+            label_bars(ax, bars, values, "{:,.1f}" if to_seconds else "{:,.0f}")
+        ax.set_xticks(x, scopes)
+        ax.set_title(f"{ROLE_LABEL.get(role, role.capitalize())} devices")
+        headroom(ax, heights, 1.20)
+        tidy(ax, categorical="x")
+
+    title = "Queue wait: pipeline against service latency  (lower is better)"
+    ylabel = f"Mean latency ({unit})"
+    view.label_axes(axes[0][0], y=ylabel)
+    suptitle(fig, view.titled(title), y=1.13 if len(shown) > 1 else 1.02)
+    if len(shown) > 1:
+        panel_legend(fig, axes[0][0], ncol=len(shown))
+
+    ratios = {
+        key: kinds["pipeline"].get("mean_ms", math.nan) / kinds["service"]["mean_ms"]
+        for key, kinds in pairs.items()
+        if "pipeline" in kinds and kinds.get("service", {}).get("mean_ms", 0.0) > 0
+    }
+    live = {k: v for k, v in ratios.items() if math.isfinite(v)}
+    if live:
+        worst = max(live, key=live.get)
+        note = (f"{worst[1]} in {worst[0]} waits {live[worst]:.1f}× its own service "
+                f"time" + (" — shorten the queue" if live[worst] >= 2 else
+                           " — little buffering"))
+        takeaway(axes[0][len(roles) // 2], note, y=-0.20)
+
+    return canvas.save(fig, applied(Chart(
+        id="queue_wait", file="", kind="comparison",
+        title="Pipeline against service latency",
+        subtitle="the difference is time spent in the hand-off queue, not on "
+                 "the device — each panel keeps its own scale",
+        summary="; ".join(f"{scope} {role} ×{ratio:.1f}"
+                          for (scope, role), ratio in live.items()),
+        metrics=["mean_ms"]),
+        view, title=title, ylabel=ylabel, shown=shown), index=11)
+
+
+# ---------------------------------------------------- 12 · free time, device
+def device_free_time(canvas: Canvas, data: RunData, view: View) -> Chart | None:
+    """Free time beside utilization, per device. The two do not sum to 100%.
+
+    They are not the same measurement seen twice. Utilization is `busy/total`
+    over one lane's `get input -> output` window; free time is the whole run
+    minus the **union** of every lane's busy intervals. A wait inside the unit
+    window counts as busy for one and free for the other, and work on a second
+    lane counts for the other and not at all for the first. So a device at 40%
+    utilization and 3% free is not idle -- it is doing work the unit window
+    never saw, and that gap is the finding (§2.10).
+    """
+    every = [d for d in data.free_devices
+             if math.isfinite(float(d.get("free", math.nan)))]
+    if len(every) < 2:
+        return None
+
+    busy = {str(d["client"]): float(d["utilization"]) for d in data.devices
+            if d.get("client") and math.isfinite(float(d.get("utilization", math.nan)))}
+    matched = any(str(d["client"]) in busy for d in every)
+
+    shown = Shown(view, [
+        ("free", "Free (all lanes idle)", S1),
+        *([("utilization", "Busy (unit window)", S2)] if matched else []),
+    ])
+    order = {role: i for i, role in enumerate(data.roles)}
+    devices = sorted(every, key=lambda d: (order.get(str(d["role"]), 9), -float(d["free"])))
+    ticks = _role_ticks(devices)
+
+    x = np.arange(len(devices), dtype=float)
+    width = 0.38 if len(shown) > 1 else 0.68
+    off = offsets(len(shown), width)
+    fig, ax = plt.subplots(figsize=(max(7.0, 0.78 * len(devices) + 2.8), 4.3))
+    for i, ref in enumerate(shown):
+        values = [float(d["free"]) if ref.key == "free"
+                  else busy.get(str(d["client"]), math.nan) for d in devices]
+        bars = ax.bar(x + off[i], values, width, label=ref.label,
+                      color=ref.color, **BAR_KW)
+        label_bars(ax, bars, values, "{:.0f}", fontsize=8, color=MUTED)
+
+    ax.set_xticks(x, ticks, fontsize=8.5)
+    title = "Free time and utilization, per device"
+    xlabel = "Device  (" + ", ".join(
+        f"{r[:1].upper()} = {ROLE_LABEL.get(r, r)}" for r in data.roles
+        if any(str(d["role"]) == r for d in devices)) + ")"
+    ylabel = "Share of the device's run (%)"
+    view.label_axes(ax, x=xlabel, y=ylabel)
+    ax.set_ylim(0, 118)          # percentages: fix the ceiling, never autoscale
+    ax.set_title(view.titled(title))
+    tidy(ax, categorical="x")
+    if len(shown) > 1:
+        ax.legend(loc="upper right", ncol=len(shown))
+
+    values = [float(d["free"]) for d in devices]
+    idlest = max(devices, key=lambda d: float(d["free"]))
+    gaps = [d for d in devices
+            if math.isfinite(busy.get(str(d["client"]), math.nan))
+            and float(d["free"]) + busy[str(d["client"])] < 85.0]
+    if gaps:
+        worst = min(gaps, key=lambda d: float(d["free"]) + busy[str(d["client"])])
+        takeaway(ax, f"{worst['role']} {ticks[devices.index(worst)]} is "
+                     f"{float(worst['free']):.0f}% free at "
+                     f"{busy[str(worst['client'])]:.0f}% utilization — the rest is "
+                     f"work the unit window never saw")
+    else:
+        takeaway(ax, f"{np.mean(values):.0f}% of the fleet's wall clock was idle; "
+                     f"quietest is {idlest['role']} at {float(idlest['free']):.0f}% free")
+
+    return canvas.save(fig, applied(Chart(
+        id="device_free_time", file="", kind="comparison",
+        title="Free time and utilization, per device",
+        subtitle="free% + utilization% ≠ 100% by construction — different "
+                 "scopes, both measured, and the gap is the finding",
+        summary=f"{len(devices)} devices, {min(values):.1f}%–{max(values):.1f}% free; "
+                f"idlest is {idlest['role']} at {float(idlest['free']):.1f}%",
+        metrics=["free", "utilization"]),
+        view, title=title, xlabel=xlabel, ylabel=ylabel, shown=shown), index=12)
+
+
+def _breakdown(rows: dict[tuple[str, str], dict[str, float]], scope: str,
+               key: str, *, renormalise: bool) -> list[tuple[str, float, float]]:
+    """`(name, seconds, share)` for one scope, largest first.
+
+    With no `SYSTEM` line the per-cluster rows are summed, which is sound:
+    seconds are additive across scopes. Their *shares* are not always -- free
+    reasons are exclusive and re-divide cleanly, busy kinds overlap across
+    lanes and do not -- so `renormalise` says which, and a share that cannot
+    honestly be recomputed comes back as `nan` and simply is not printed.
+    """
+    seconds: dict[str, float] = {}
+    stated: dict[str, float] = {}
+    for (row_scope, name), stats in rows.items():
+        if scope and row_scope != scope:
+            continue
+        value = stats.get(key, math.nan)
+        if not math.isfinite(value):
+            continue
+        seconds[name] = seconds.get(name, 0.0) + value
+        stated[name] = stats.get("share", math.nan) if scope else math.nan
+
+    total = sum(seconds.values())
+    out = []
+    for name, value in seconds.items():
+        share = stated[name]
+        if not math.isfinite(share) and renormalise and total:
+            share = value / total * 100.0
+        out.append((name, value, share))
+    return sorted(out, key=lambda row: -row[1])
+
+
+# ------------------------------------------------- 13 · free time, breakdown
+def free_time_breakdown(canvas: Canvas, data: RunData, view: View) -> Chart | None:
+    """Why the fleet was free, and where its busy time went.
+
+    Two part-to-whole readings that obey different arithmetic, which is why
+    they are two panels and why the subtitle says so. `FREE reason=` shares are
+    attributed in a fixed priority and sum to exactly 100% of the scope's free
+    time, with whatever no reason covers carried as `unaccounted`. `KIND kind=`
+    shares **overlap** -- a pipelined device runs its lanes at once -- so they
+    may sum past 100%, and only the merged busy total is exclusive (§2.11).
+
+    Neither panel colors by rank: every bar in a panel wears one hue and the
+    name is on the tick, so re-ordering the run cannot repaint the chart.
+    """
+    scope = data.free_scope()
+    reasons = _breakdown(data.free_reasons, scope, "free_s", renormalise=True)
+    kinds = _breakdown(data.free_kinds, scope, "busy_s", renormalise=False)
+    if not reasons and not kinds:
+        return None
+
+    panels = [
+        ("reason", "Why it was free", S1, reasons, "Free time (s)"),
+        ("kind", "Where the busy time went", S2, kinds, "Busy time (s)"),
+    ]
+    shown = Shown(view, [(key, label, color) for key, label, color, rows, _ in panels
+                         if rows])
+    drawn = [p for p in panels if shown.has(p[0]) and p[3]]
+    if not drawn:
+        return None
+
+    tallest = max(len(rows) for _, _, _, rows, _ in drawn)
+    fig, axes = plt.subplots(1, len(drawn), squeeze=False,
+                             figsize=(6.2 * len(drawn), max(3.4, 0.42 * tallest + 2.2)))
+    for ax, (_, label, color, rows, axis_label) in zip(axes[0], drawn):
+        y = np.arange(len(rows), dtype=float)[::-1]
+        bars = ax.barh(y, [seconds for _, seconds, _ in rows], 0.62,
+                       color=color, **BAR_KW)
+        ax.bar_label(
+            bars, padding=4, fontsize=8.5, color=INK_2,
+            labels=[f"{seconds:,.0f}s" + (f"  {share:.0f}%" if math.isfinite(share) else "")
+                    for _, seconds, share in rows],
+        )
+        ax.set_yticks(y, [name for name, _, _ in rows], fontsize=9.5)
+        ax.set_title(label)
+        ax.set_xlabel(axis_label)
+        ax.set_xlim(0, max(seconds for _, seconds, _ in rows) * 1.30)
+        tidy(ax, categorical="y")
+
+    title = "Free time by reason, busy time by kind"
+    where = scope or "all clusters"
+    suptitle(fig, view.titled(title))
+
+    top = reasons[0] if reasons else None
+    return canvas.save(fig, applied(Chart(
+        id="free_time_breakdown", file="", kind="distribution",
+        title=title,
+        subtitle=f"{where} · reasons are exclusive and sum to the scope's free "
+                 "time; kinds overlap across lanes and may sum past its span",
+        summary=(f"largest reason {top[0]} at {top[1]:,.0f}s"
+                 + (f" ({top[2]:.0f}% of free time)" if math.isfinite(top[2]) else "")
+                 if top else "; ".join(f"{n} {v:,.0f}s" for n, v, _ in kinds)),
+        metrics=["free_s", "busy_s", "share"]),
+        view, title=title, shown=shown), index=13)
+
+
+# ------------------------------------------------- 14 · free time, machines
+def machine_free_time(canvas: Canvas, data: RunData, view: View) -> Chart | None:
+    """Per host: what the pipeline left idle, against what the OS saw idle.
+
+    A machine is free only when **none** of the device processes on it is
+    working, which cannot be recovered from their individual ratios -- two
+    processes each 50% free can keep a host 100% busy by interleaving. So these
+    come from the union of their busy intervals, safe here and nowhere else
+    because processes on one host share a clock.
+
+    `host_idle` is the OS's own accounting across every process on the box, and
+    the two disagreeing is the informative case: idle pipeline on a busy host
+    means something else is eating the CPU; busy pipeline on an idle host means
+    it is blocked on I/O rather than on compute (§2.11).
+    """
+    def value(row: dict[str, object], key: str) -> float:
+        return float(row.get(key, math.nan) or math.nan)
+
+    # The host running only the controller carries `host_idle` and no pipeline
+    # figure of its own. It is kept: a fleet view that leaves out the machine
+    # holding the controller is not a fleet view, and `grouped_x` centres its
+    # lone bar on the tick rather than parking it beside an empty slot.
+    rows = [m for m in data.machines
+            if math.isfinite(value(m, "free")) or math.isfinite(value(m, "host_idle"))]
+    if len(rows) < 2:
+        return None
+    rows.sort(key=lambda m: (not math.isfinite(value(m, "free")),
+                             -(value(m, "free") if math.isfinite(value(m, "free"))
+                               else value(m, "host_idle"))))
+
+    has_idle = any(math.isfinite(value(m, "host_idle")) for m in rows)
+    shown = Shown(view, [
+        ("free", "Pipeline free", S1),
+        *([("host_idle", "Host idle (OS)", S2)] if has_idle else []),
+    ])
+    width = 0.38 if len(shown) > 1 else 0.62
+    heights = [[value(m, ref.key) for m in rows] for ref in shown]
+    positions = grouped_x(heights, width)
+
+    fig, ax = plt.subplots(figsize=(max(7.0, 1.15 * len(rows) + 3.0), 4.3))
+    x = np.arange(len(rows), dtype=float)
+    for i, ref in enumerate(shown):
+        bars = ax.bar(positions[i], heights[i], width, label=ref.label,
+                      color=ref.color, **BAR_KW)
+        label_bars(ax, bars, heights[i], "{:.0f}", fontsize=8.5)
+
+    ax.set_xticks(x, [str(m["machine"]) for m in rows], fontsize=9)
+    title = "Idle time by machine"
+    xlabel, ylabel = "Machine", "Share of the run (%)"
+    view.label_axes(ax, x=xlabel, y=ylabel)
+    ax.set_ylim(0, 118)
+    ax.set_title(view.titled(title))
+    tidy(ax, categorical="x")
+    if len(shown) > 1:
+        ax.legend(loc="upper right", ncol=len(shown))
+
+    paired = [m for m in rows if math.isfinite(value(m, "free"))
+              and math.isfinite(value(m, "host_idle"))]
+    if paired:
+        quietest = paired[0]
+        free, idle = value(quietest, "free"), value(quietest, "host_idle")
+        # The four-way read of §2.11: the two numbers answer different
+        # questions, and which way they disagree names the cause.
+        reading = ("spare capacity — run fewer machines or give them more work"
+                   if free > 50 and idle > 50 else
+                   "something else on the box is using the CPU" if free > 50 else
+                   "blocked on I/O or the network, not on compute" if idle > 50 else
+                   "saturated")
+        takeaway(ax, f"{quietest['machine']}: {free:.0f}% pipeline free, "
+                     f"{idle:.0f}% host idle — {reading}")
+
+    slop = sum(value(m, "merge_slop_s") for m in rows
+               if math.isfinite(value(m, "merge_slop_s")))
+    return canvas.save(fig, applied(Chart(
+        id="machine_free_time", file="", kind="comparison",
+        title=title,
+        subtitle="from the union of every device process on the host, never "
+                 "from their ratios"
+                 + (f" · {slop:,.1f}s swallowed by the interval cap, so this "
+                    "reads slightly low" if slop > 0 else ""),
+        summary="; ".join(
+            f"{m['machine']} " + (f"{value(m, 'free'):.1f}% free"
+                                  if math.isfinite(value(m, "free"))
+                                  else f"{value(m, 'host_idle'):.1f}% host idle, "
+                                       "no pipeline stage")
+            for m in rows),
+        metrics=["free", "host_idle"]),
+        view, title=title, xlabel=xlabel, ylabel=ylabel, shown=shown), index=14)
+
+
+# --------------------------------------------------- 15 · free time, in time
+def free_time_over_run(canvas: Canvas, data: RunData, view: View) -> Chart | None:
+    """A heat map: one row per device, time across, free share as the color.
+
+    Magnitude, so the color is one hue light to dark -- never a rainbow, and
+    never a categorical slot, because the quantity being encoded is *how much*
+    rather than *which*.
+
+    The x axis is each device's **own** `t_offset_s`. Devices do not start
+    together, so two cells in one column are not the same instant; the rows say
+    when each device was idle relative to its own run, and lining them up in
+    absolute time is exactly what this file does not support (§2.12).
+    """
+    clients = [c for c, points in data.free_series.items() if len(points) >= 2]
+    if not clients:
+        return None
+
+    meta = data.free_series_meta
+    order = {role: i for i, role in enumerate(data.roles)}
+    present = [r for r in data.roles
+               if any(meta.get(c, {}).get("role") == r for c in clients)]
+    shown = Shown(view, [(r, ROLE_LABEL.get(r, r), ROLE_COLOR.get(r, MUTED))
+                         for r in present])
+    kept = {r.key for r in shown}
+    clients = [c for c in clients if meta.get(c, {}).get("role", "") in kept] or clients
+    clients.sort(key=lambda c: (order.get(meta.get(c, {}).get("role", ""), 9),
+                                meta.get(c, {}).get("cluster", ""), c))
+
+    width = max(len(data.free_series[c]) for c in clients)
+    # Ragged rows padded with nan rather than zero: a device that had stopped
+    # is not a device that was busy, and the colormap paints the gap as surface.
+    grid = np.full((len(clients), width), np.nan)
+    for row, client in enumerate(clients):
+        for point in data.free_series[client]:
+            grid[row, point.index] = point.value
+
+    bucket = num(next((meta.get(c, {}).get("bucket_s", "") for c in clients), ""))
+    span = width * bucket if math.isfinite(bucket) and bucket > 0 else float(width)
+    cmap = LinearSegmentedColormap.from_list("free", pal.SEQUENTIAL)
+    cmap.set_bad(SURFACE)
+
+    fig, ax = plt.subplots(figsize=(11.5, max(3.0, 0.34 * len(clients) + 1.9)))
+    mesh = ax.imshow(grid, aspect="auto", origin="upper", cmap=cmap,
+                     vmin=0.0, vmax=100.0, interpolation="nearest",
+                     extent=(0.0, span, len(clients) - 0.5, -0.5))
+    ax.set_yticks(np.arange(len(clients), dtype=float), _role_ticks(
+        [{"role": meta.get(c, {}).get("role", "unknown")} for c in clients]),
+        fontsize=8.5)
+    bar = fig.colorbar(mesh, ax=ax, pad=0.015, fraction=0.035)
+    bar.set_label("Free (% of the bucket)", fontsize=10, color=INK_2)
+    bar.outline.set_visible(False)
+
+    title = "Free time over the run, per device"
+    xlabel = ("seconds into that device's own run"
+              if math.isfinite(bucket) and bucket > 0 else "bucket index")
+    ylabel = "Device"
+    view.label_axes(ax, x=xlabel, y=ylabel)
+    ax.set_title(view.titled(title))
+    ax.grid(visible=False)
+    tidy(ax, hide=("top", "right", "left"))
+    takeaway(ax, "read against chart 02: a band of free time that lines up with "
+                 "a throughput dip names the stage that stalled", y=-0.24)
+
+    means = {c: float(np.nanmean([p.value for p in data.free_series[c]]))
+             for c in clients}
+    return canvas.save(fig, applied(Chart(
+        id="free_time_series", file="", kind="trend",
+        title=title,
+        subtitle=(f"{fmt(bucket)}s buckets · " if math.isfinite(bucket) else "")
+                 + "each row on its own device's clock — a column is not one "
+                   "instant across rows",
+        summary="; ".join(f"{meta.get(c, {}).get('role', '?')} {value:.0f}% free "
+                          f"on average" for c, value in means.items()),
+        metrics=["free"]),
+        view, title=title, xlabel=xlabel, ylabel=ylabel, shown=shown), index=15)
+
+
+# ------------------------------------------------------ 16 · queue-host RAM
+def broker_ram_timeline(canvas: Canvas, data: RunData, view: View) -> Chart | None:
+    """The queue host's memory over the run, with throughput under it.
+
+    Nothing of ours runs on that machine, and it is on the critical path
+    anyway. A broker at its high-water mark does not fail -- it blocks
+    publishers -- and on the worker that looks like a stall with no local
+    cause. *The next stage is slow* and *the broker stopped accepting* produce
+    almost identical worker-side telemetry, and this curve is what separates
+    them (§2.13).
+
+    Throughput goes in a second panel rather than on a second y axis. Two
+    scales on one frame let the reader place the crossing wherever the drawing
+    happened to put it; stacked panels on a shared x show the same coincidence
+    and cannot be tuned into saying something else.
+    """
+    samples = [s for s in data.broker_samples
+               if math.isfinite(s.get("used_mb", math.nan))]
+    if len(samples) < 4:
+        return None
+
+    at = np.array([s["at"] for s in samples], dtype=float)
+    columns = {
+        "used": ("Used (MemTotal − MemAvailable)", S1, "used_mb"),
+        "rss": ("Broker process RSS", S2, "rss_mb"),
+        "swap": ("Swap used", S3, "swap_used_mb"),
+    }
+    refs = [(key, label, color) for key, (label, color, field_) in columns.items()
+            if any(math.isfinite(s.get(field_, math.nan)) and s.get(field_, 0.0) > 0
+                   for s in samples)]
+    if data.system_fps:
+        refs.append(("throughput", "System throughput", pal.SLOTS_LIGHT[3]))
+    shown = Shown(view, refs)
+
+    curves = [r for r in shown if r.key != "throughput"]
+    with_fps = shown.has("throughput") and bool(data.system_fps)
+    if not curves and not with_fps:
+        return None
+
+    heights = [2.6, 1.5] if (curves and with_fps) else [2.6]
+    fig, axes = plt.subplots(len(heights), 1, figsize=(11.5, 1.55 * sum(heights)),
+                             sharex=True, squeeze=False,
+                             gridspec_kw=dict(height_ratios=heights))
+    panels = list(axes[:, 0])
+    top = panels[0] if curves else None
+
+    total = next((s["total_mb"] for s in samples
+                  if math.isfinite(s.get("total_mb", math.nan))), math.nan)
+    peak = max((s["used_mb"] for s in samples), default=math.nan)
+    if top is not None:
+        for ref in curves:
+            values = np.array([s.get(columns[ref.key][2], math.nan) for s in samples],
+                              dtype=float)
+            top.plot(at, values, color=ref.color, label=ref.label, **LINE_KW)
+            _endpoint(top, float(at[-1]), float(values[-1]), ref.color,
+                      f"{values[-1]:,.0f}")
+        if math.isfinite(total) and peak >= total * 0.5:
+            # The wall is only drawn when the run came close to it. Anchoring a
+            # 1.8 GB curve to a 5.9 GB ceiling flattens it into a horizontal
+            # line and costs the chart the one shape it exists to show; chart
+            # 17 answers "how full did it get" on its own axis instead.
+            top.axhline(total, color=AXIS, linewidth=1.0)
+            top.annotate(f"installed {total:,.0f} MB", xy=(0.995, total),
+                         xycoords=("axes fraction", "data"), xytext=(0, 5),
+                         textcoords="offset points", ha="right",
+                         fontsize=9, color=MUTED)
+            top.set_ylim(0, total * 1.10)
+        else:
+            headroom(top, [s.get(columns[r.key][2], math.nan)
+                           for r in curves for s in samples], 1.18)
+        view.label_axes(top, y="Memory (MB)")
+        tidy(top)
+        if len(curves) > 1:
+            top.legend(loc="upper left", ncol=len(curves))
+
+    if with_fps:
+        ax = panels[-1]
+        fx = np.array([p.at for p in data.system_fps], dtype=float)
+        fy = np.array([p.value for p in data.system_fps], dtype=float)
+        window = stable_smooth(len(fy), data.full_counts.get("system", 0))
+        ax.plot(fx, rolling_mean(fy, window) if window else fy,
+                color=pal.SLOTS_LIGHT[3], label="System throughput", **LINE_KW)
+        ax.set_ylabel("FPS", fontsize=10.5, color=INK_2)
+        headroom(ax, fy, 1.12)
+        tidy(ax)
+
+    title = "Queue-host RAM over the run"
+    xlabel = "seconds into the run"
+    panels[-1].set_xlabel(view.xlabel or xlabel)
+    panels[-1].set_xlim(float(at[0]), float(at[-1]))
+    suptitle(fig, view.titled(title))
+
+    used = np.array([s["used_mb"] for s in samples], dtype=float)
+    label = ("host memory, every process on the box"
+             if data.broker_source == "ssh" else
+             "the broker process alone, not the host"
+             if data.broker_source else "source not stated")
+    return canvas.save(fig, applied(Chart(
+        id="broker_ram_timeline", file="", kind="trend",
+        title=title,
+        subtitle=f"source={data.broker_source or '?'} — {label}"
+                 + (f" · {data.broker_host}" if data.broker_host else ""),
+        summary=f"{len(samples)} samples, {used.min():,.0f}–{used.max():,.0f} MB"
+                + (f" of {total:,.0f} MB installed" if math.isfinite(total) else "")
+                + "; memory climbing while throughput falls is backpressure",
+        metrics=["used_mb", "rss_mb", "swap_used_mb"]),
+        view, title=title, xlabel=xlabel, ylabel="Memory (MB)", shown=shown), index=16)
+
+
+# ----------------------------------------------- 17 · queue-host RAM profile
+def broker_ram_profile(canvas: Canvas, data: RunData, view: View) -> Chart | None:
+    """How full the queue host got, and how much of that the run added.
+
+    Three questions, three panels, deliberately not sharing a y axis: the level
+    is hundreds of MB against an installed total, the change across the run is
+    usually a fraction of that, and the broker's own RSS answers whether the
+    box was full *because of the thing being measured*. One scale would flatten
+    two of the three to nothing.
+
+    Percentiles are nearest-rank over the raw samples, so every bar is a
+    reading that was actually taken (§2.14).
+    """
+    used, delta, rabbit = (data.broker.get(k, {}) for k in ("USED", "DELTA", "RABBIT"))
+    panels = [
+        ("used", "How full it got", S1,
+         [("min_mb", "Min"), ("mean_mb", "Mean"), ("p50_mb", "p50"),
+          ("p95_mb", "p95"), ("max_mb", "Max")], used),
+        ("delta", "What the run added", S2,
+         [("start_mb", "Start"), ("end_mb", "End"), ("growth_mb", "Growth"),
+          ("peak_over_start_mb", "Peak over start")], delta),
+        # RSS answers "is it full *because of the thing I care about*"; swap
+        # answers whether the host was already past the point where its latency
+        # contribution is stable. Both belong to the box, not to the process,
+        # so the panel is titled for what is actually in it.
+        ("rabbit", "Broker RSS, and the host's swap", S3,
+         [("mean_rss_mb", "Mean RSS"), ("max_rss_mb", "Max RSS"),
+          ("swap_max_mb", "Swap max")], rabbit),
+    ]
+    live = [p for p in panels
+            if any(math.isfinite(p[4].get(key, math.nan)) for key, _ in p[3])]
+    if not live:
+        return None
+
+    shown = Shown(view, [(key, label, color) for key, label, color, _, _ in live])
+    drawn = [p for p in live if shown.has(p[0])]
+    total = data.broker.get("BROKER", {}).get("total_mb", math.nan)
+
+    fig, axes = plt.subplots(1, len(drawn), squeeze=False,
+                             figsize=(4.4 * len(drawn), 4.2))
+    for ax, (key, label, color, fields, stats) in zip(axes[0], drawn):
+        values = [stats.get(name, math.nan) for name, _ in fields]
+        x = np.arange(len(fields), dtype=float)
+        bars = ax.bar(x, values, min(0.58, 2.4 / len(fields)), color=color, **BAR_KW)
+        label_bars(ax, bars, values, "{:,.0f}")
+        ax.set_xticks(x, [text for _, text in fields], fontsize=9.5)
+        ax.set_title(label)
+        if key == "used" and math.isfinite(total):
+            ax.axhline(total, color=AXIS, linewidth=1.0)
+            ax.annotate(f"installed {total:,.0f} MB", xy=(0.02, total),
+                        xycoords=("axes fraction", "data"), xytext=(0, 5),
+                        textcoords="offset points", fontsize=9, color=MUTED)
+            ax.set_ylim(0, total * 1.12)
+        else:
+            headroom(ax, values, 1.20)
+        tidy(ax, categorical="x")
+
+    title = "Queue-host RAM profile"
+    view.label_axes(axes[0][0], y="Memory (MB)")
+    suptitle(fig, view.titled(title))
+
+    swap = rabbit.get("swap_max_mb", math.nan)
+    growth = delta.get("growth_mb", math.nan)
+    middle = axes[0][len(drawn) // 2]     # centred under the figure, not panel 1
+    if math.isfinite(swap) and swap > 0:
+        takeaway(middle, f"the host held {swap:,.0f} MB of swap — any latency "
+                         "conclusion from this run is unsafe")
+    elif math.isfinite(growth):
+        takeaway(middle, f"the run left {growth:+,.0f} MB behind"
+                         + (" — units are still buffered somewhere"
+                            if growth > 0 else " — the drain gave it back"))
+
+    return canvas.save(fig, applied(Chart(
+        id="broker_ram_profile", file="", kind="comparison",
+        title=title,
+        subtitle=f"source={data.broker_source or '?'} · percentiles are "
+                 "nearest-rank over the raw samples — each bar is a reading "
+                 "that was taken · each panel keeps its own scale",
+        summary=(f"peaked at {used.get('max_mb', math.nan):,.0f} MB"
+                 + (f" of {total:,.0f} MB" if math.isfinite(total) else "")
+                 + (f", {growth:+,.0f} MB across the run"
+                    if math.isfinite(growth) else "")),
+        metrics=["used_mb", "growth_mb", "rss_mb"]),
+        view, title=title, ylabel="Memory (MB)", shown=shown), index=17)
+
+
 # ------------------------------------------------------------------- tiles
 def tiles(data: RunData) -> list[Tile]:
     """C12 — the numbers that *are* the story, not one-bar bar charts.
@@ -738,6 +1376,38 @@ def tiles(data: RunData) -> list[Tile]:
                         unit="s mean", source="latency_cluster.log",
                         delta=f"p95 {e2e.get('p95_ms', math.nan) / 1000:.1f}s"))
 
+    # Capacity, not performance: a fleet at 60% free is not slow, it is three
+    # times larger than the workload needs. It sits beside utilization rather
+    # than instead of it because the two are not complements (§2.10).
+    fleet = data.free_time.get((SYSTEM, "all"), {})
+    free = fleet.get("free", math.nan)
+    if math.isfinite(free):
+        mean = fleet.get("free_mean", math.nan)
+        uneven = math.isfinite(mean) and abs(mean - free) > 5
+        out.append(Tile(
+            label="Fleet free time", value=f"{free:.1f}", unit="%",
+            source="free_time_cluster.log",
+            delta=(f"mean {mean:.1f}% — some devices idle far more than others"
+                   if uneven else f"{fmt(fleet.get('devices'))} devices"),
+            delta_kind="bad" if uneven else ""))
+
+    peak = data.broker.get("USED", {}).get("max_mb", math.nan)
+    if math.isfinite(peak):
+        swap = data.broker.get("RABBIT", {}).get("swap_max_mb", math.nan)
+        growth = data.broker.get("DELTA", {}).get("growth_mb", math.nan)
+        total = data.broker.get("BROKER", {}).get("total_mb", math.nan)
+        # The source is part of the number: `ssh` is the host, `rabbitmq_api`
+        # is one process, and a tile that reads "1,586 MB" without saying which
+        # is a plausible figure meaning something other than its own label.
+        out.append(Tile(
+            label="Queue-host RAM peak", value=f"{peak:,.0f}", unit="MB",
+            source=f"broker_ram.log · source={data.broker_source or '?'}",
+            delta=(f"{swap:,.0f} MB swap — latency figures here are unsafe"
+                   if math.isfinite(swap) and swap > 0 else
+                   f"{growth:+,.0f} MB across the run" if math.isfinite(growth) else
+                   f"of {total:,.0f} MB installed" if math.isfinite(total) else ""),
+            delta_kind="bad" if math.isfinite(swap) and swap > 0 else ""))
+
     for key, label, unit in (("batch_size", "Batch size", ""),
                              ("num_bit", "Quantization", "bit"),
                              ("window_batches", "mAP window", "batches")):
@@ -767,6 +1437,10 @@ CATALOGUE: tuple[Callable[[Canvas, RunData, View], Chart | None], ...] = (
     throughput_by_cluster, system_fps_timeline, cluster_fps_timeline,
     fps_distribution, service_latency, e2e_profile, utilization_by_role,
     device_utilization, accuracy_by_window, accuracy_summary,
+    # The diagnostics. A run that measured neither optional feature draws the
+    # first ten and stops, which is why they come after rather than between.
+    queue_wait, device_free_time, free_time_breakdown, machine_free_time,
+    free_time_over_run, broker_ram_timeline, broker_ram_profile,
 )
 
 
@@ -782,7 +1456,7 @@ CATALOGUE: tuple[Callable[[Canvas, RunData, View], Chart | None], ...] = (
 #: keep describing the whole run and say so.
 WINDOWED = frozenset({
     "system_window_fps", "cluster_window_fps", "window_fps_distribution",
-    "map_by_window",
+    "map_by_window", "broker_ram_timeline",
 })
 RECOMPUTED = frozenset({"throughput_by_cluster"})
 
@@ -814,6 +1488,13 @@ def _note_window(chart: Chart, data: RunData) -> None:
                      "matched frame by frame over everything")
         else:
             scope = whole
+    elif chart.id == "free_time_series":
+        # A series the window still cannot cut: its offsets are each device's
+        # own clock, and the window is a span of the system's. Saying "whole
+        # run" alone would read as "the run only wrote a total", which is the
+        # wrong reason and would invite someone to go and fix it.
+        scope = (f"whole run — these buckets are on each device's own clock, "
+                 f"which the {label} window cannot be measured against")
     elif chart.id in RECOMPUTED and "throughput" in data.recomputed:
         scope = f"recomputed over {label} of the run"
     elif chart.id in WINDOWED:
@@ -878,4 +1559,11 @@ CHART_IDS: dict[str, str] = {
     "device_utilization": "device_utilization",
     "accuracy_by_window": "map_by_window",
     "accuracy_summary": "map_summary",
+    "queue_wait": "queue_wait",
+    "device_free_time": "device_free_time",
+    "free_time_breakdown": "free_time_breakdown",
+    "machine_free_time": "machine_free_time",
+    "free_time_over_run": "free_time_series",
+    "broker_ram_timeline": "broker_ram_timeline",
+    "broker_ram_profile": "broker_ram_profile",
 }

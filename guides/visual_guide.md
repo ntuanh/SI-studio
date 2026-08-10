@@ -1015,12 +1015,24 @@ Write this table into the notebook's opening markdown cell. It is how a reader
 | `fps_cluster.log` | 1 row per cluster + `SYSTEM` summary | C1 |
 | `fps_cluster_ns.log` | per-cluster rolling window samples | C2, C4 |
 | `batch_done_ns.log` | system-wide rolling window samples | C3 |
-| `latency_cluster.log` | service (per role) + e2e stats | C5, C6 |
+| `latency_cluster.log` | service + pipeline (per role) + e2e stats | C5, C6, 11 |
 | `utilization_cluster.log` | utilization by cluster × role | C7 |
-| `utilization.log` | 1 row per device | C8 |
+| `utilization.log` | 1 row per device | C8, 12 |
 | `map_window.log` | accuracy per sliding window | C9 |
 | `map.log` | accuracy summary | C10 |
+| `cut_change_ns.log` | control events on the run clock | rules on 02 |
+| `free_time.log` | 1 row per device | 12 |
+| `free_time_cluster.log` | free by scope, reason, kind and machine | 13, 14 |
+| `free_time_series.log` | free % per device per time bucket | 15 |
+| `broker_ram_ns.log` | queue-host RAM samples on the run clock | 16 |
+| `broker_ram.log` | queue-host RAM summary | 17 |
 | *(derived)* | headline metrics from several files | C11 |
+
+C1–C11 are the recipes in Part II. 11–17 are the diagnostic charts in
+`runcharts.py` that the last five inputs feed: 11 is the queue wait that
+`kind=pipeline` makes visible, 12–15 are free time, 16–17 are the queue host.
+The last five inputs are optional and arrive in two all-or-nothing groups, so a
+run draws all of a group's charts or none of them — never a partial set.
 
 If an input feeds nothing, either chart it or say in the notebook why not.
 

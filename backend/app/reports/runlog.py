@@ -10,10 +10,10 @@ things like "`clusters=2` in fps_cluster.log vs `clusters=2` in
 utilization_cluster.log", which is not a comparison anybody asked for.
 
 The result directory *does* have a schema -- `guides/server_results_guide.md`
-documents all nine files line by line -- and `guides/visual_guide.md` §III.3
+documents all fourteen files line by line -- and `guides/visual_guide.md` §III.3
 maps each of them to the chart it feeds. So this reads them as themselves:
-cluster, role and kind become dimensions, and `charts.py` gets to plot the
-comparison the run is actually about.
+cluster, role, kind, reason and machine become dimensions, and `charts.py` gets
+to plot the comparison the run is actually about.
 
 Conventions from the visual guide §III.2, applied here rather than downstream:
 
@@ -41,11 +41,21 @@ from .window import Window
 
 log = logging.getLogger(__name__)
 
-#: The nine files of `server_results_guide.md` §2, plus the archived config.
+#: The nine files every run writes (`server_results_guide.md` §2), plus the
+#: archived config. Absence here is worth a warning; see `OPTIONAL` below.
 FILES = (
     "batch_done_ns.log", "fps_cluster_ns.log", "fps_cluster.log",
     "utilization.log", "utilization_cluster.log", "latency_cluster.log",
     "map_window.log", "map.log", "cut_change_ns.log",
+)
+
+#: §2.10-2.14 — the two optional features, each all-or-nothing. Read when they
+#: are there and never missed when they are not: a run measures free time or it
+#: does not, and warning about their absence on every other run would train an
+#: operator to ignore the line that says a *required* file went missing.
+OPTIONAL = (
+    "free_time.log", "free_time_cluster.log", "free_time_series.log",
+    "broker_ram_ns.log", "broker_ram.log",
 )
 
 #: Enough of them present to be sure. `fps_cluster.log` carries the headline
@@ -56,8 +66,17 @@ _REQUIRED = ("fps_cluster.log", "fps_cluster_ns.log", "batch_done_ns.log")
 SYSTEM = "System"
 OVERALL = "Overall"
 
-_KV = re.compile(r"([A-Za-z][\w.]*)=([^\s]+)")
+#: `key=value`, tolerating the padding a right-aligned column leaves behind.
+#: The grammar says a value carries no spaces, and `free_s= 27.222 free= 4.54%`
+#: in the free-time spec breaks it -- the writer pads the number so a column of
+#: them lines up. Without the `\s*` those two keys simply do not match, and a
+#: chart of "free time" would quietly be drawn from the devices whose numbers
+#: happened to be wide enough not to need padding.
+_KV = re.compile(r"([A-Za-z][\w.]*)=\s*([^\s]+)")
 _NS = re.compile(r"^(\d{13,})\b")
+#: `samples=0 (permission denied)` — the trailing free text, which is
+#: informational everywhere except here, where it is the whole diagnosis.
+_REASON = re.compile(r"\(([^)]+)\)\s*$")
 #: `<ns> intermediate_queue_0: cut 11->12 deeper` -- matched against the body,
 #: never the whole line: the ns timestamp is `\S+` too.
 _CUT = re.compile(r"(\S+):\s*cut\s+(\d+)\s*->\s*(\d+)\s*(\w+)?")
@@ -112,7 +131,7 @@ class Point:
 
 @dataclass
 class RunData:
-    """Everything the nine files said, keyed by dimension rather than by file."""
+    """Everything the run's files said, keyed by dimension rather than by file."""
 
     tag: str = ""
     clusters: list[str] = field(default_factory=list)
@@ -153,6 +172,55 @@ class RunData:
     #: map_window.log — cluster -> the sliding-window series
     accuracy_window: dict[str, list[dict[str, float]]] = field(default_factory=dict)
 
+    #: free_time.log — one row per device. Free time is the wall clock in
+    #: which a device did *nothing*: the span minus the **union** of every
+    #: lane's busy intervals. It is not `1 - utilization` and the two must
+    #: never be expected to sum to 100% (§2.10) — a wait inside a unit window
+    #: counts as busy there and free here, and work on a second lane counts
+    #: here and nowhere there.
+    free_devices: list[dict[str, object]] = field(default_factory=list)
+    #: free_time_cluster.log — (scope, role) -> {free, free_mean, free_s, …}.
+    #: `role` is "all" on the rolled-up `ALL`/`SYSTEM` lines, as in
+    #: `utilization`, so the two files read the same way.
+    free_time: dict[tuple[str, str], dict[str, float]] = field(default_factory=dict)
+    #: `FREE reason=` — (scope, reason) -> {free_s, share}. Attributed in a
+    #: fixed priority, so the shares sum to exactly 100% of that scope's free
+    #: time and the remainder is carried as `unaccounted` rather than dropped.
+    free_reasons: dict[tuple[str, str], dict[str, float]] = field(default_factory=dict)
+    #: `KIND kind=` — (scope, kind) -> {busy_s, share}. These **overlap**: a
+    #: pipelined device runs its lanes at once, so the shares may sum past
+    #: 100% and only the merged `busy_s` in `free_devices` is exclusive.
+    free_kinds: dict[tuple[str, str], dict[str, float]] = field(default_factory=dict)
+    #: `MACHINE machine=` — one row per host, from the union of the busy
+    #: intervals of every device *process* on it. Two devices that are each
+    #: 50% free can keep a machine 100% busy by interleaving, so this cannot
+    #: be recovered from their ratios.
+    machines: list[dict[str, object]] = field(default_factory=list)
+    #: free_time_series.log — client -> the per-bucket free share. `at` is
+    #: `t_offset_s`, seconds on **that device's own clock**; devices start at
+    #: different moments, so these offsets are not comparable across rows and
+    #: cannot be cut on the system's clock.
+    free_series: dict[str, list[Point]] = field(default_factory=dict)
+    #: client -> {role, machine, cluster, bucket_s} for the rows above.
+    free_series_meta: dict[str, dict[str, str]] = field(default_factory=dict)
+
+    #: broker_ram_ns.log — one dict per sample of the queue host, `at` in
+    #: seconds on the run's clock. Nothing of ours runs on that machine, so
+    #: the server pulls this from outside; `broker_source` says how, and the
+    #: label is load-bearing (§2.13).
+    broker_samples: list[dict[str, float]] = field(default_factory=list)
+    #: broker_ram.log — "BROKER" | "USED" | "DELTA" | "RABBIT" -> its numbers.
+    broker: dict[str, dict[str, float]] = field(default_factory=dict)
+    broker_host: str = ""
+    #: `ssh` = host memory, `MemTotal - MemAvailable`, every process on the
+    #: box. `rabbitmq_api` = the broker process alone. Never silently
+    #: substituted for each other: they answer different questions.
+    broker_source: str = ""
+    #: Why there are no samples, when there are none. A missing file is
+    #: indistinguishable from a run where the host was fine; "0 samples
+    #: (permission denied)" is not.
+    broker_note: str = ""
+
     #: cut_change_ns.log — adaptive split-point moves, seconds into the run
     cuts: list[dict[str, object]] = field(default_factory=list)
     #: config.yaml — the settings that produced these numbers
@@ -184,7 +252,8 @@ class RunData:
     def roles(self) -> list[str]:
         """`cloud` before `edge`: the order the pipeline runs in, not alphabetical."""
         seen = {role for _, role in self.utilization if role != "all"}
-        seen |= {str(d["role"]) for d in self.devices}
+        seen |= {role for _, role in self.free_time if role != "all"}
+        seen |= {str(d["role"]) for d in (*self.devices, *self.free_devices)}
         return [r for r in ("cloud", "edge") if r in seen] + sorted(seen - {"cloud", "edge"})
 
     @property
@@ -193,6 +262,17 @@ class RunData:
 
     def system(self, field_: str) -> float:
         return self.throughput.get(SYSTEM, {}).get(field_, math.nan)
+
+    def free_scope(self) -> str:
+        """Which scope the free-time breakdowns describe: `SYSTEM` if it wrote one.
+
+        A run that rolled its reasons up to the fleet gets the fleet's answer,
+        which is the first line of the guide's reading order. One that only
+        broke them down per cluster is summed instead — free seconds *are*
+        additive across scopes, so that sum is the same measurement.
+        """
+        scopes = {scope for scope, _ in (*self.free_reasons, *self.free_kinds)}
+        return SYSTEM if SYSTEM in scopes else ""
 
     @property
     def batch_size(self) -> float:
@@ -409,6 +489,160 @@ def read_accuracy(root: Path, data: RunData) -> None:
         rows.sort(key=lambda r: r["window"])
 
 
+def read_free_time(root: Path, data: RunData) -> None:
+    """`free_time.log` §2.10 and `free_time_cluster.log` §2.11.
+
+    Six line kinds share the rolled-up file, and they are told apart by their
+    flag before their keys: a `FREE reason=` line also carries `cluster=`, so
+    reading the scope first and the flag second would file every breakdown as
+    a cluster total and overwrite the real one.
+    """
+    for line in _lines(root, "free_time.log"):
+        _, _, kv, _body = _split(line)
+        if "free" not in kv:
+            continue
+        data.free_devices.append({
+            "client": kv.get("client", ""),
+            "role": kv.get("role", "unknown"),
+            "machine": kv.get("machine", ""),
+            "cluster": cluster_label(kv.get("cluster", "")),
+            "device": kv.get("device", ""),
+            "span_s": num(kv.get("span_s")),
+            "busy_s": num(kv.get("busy_s")),
+            "free_s": num(kv.get("free_s")),
+            "free": num(kv["free"]),
+            "gaps": num(kv.get("gaps")),
+            "longest_free_ms": num(kv.get("longest_free_ms")),
+            "host_idle": num(kv.get("host_idle")),
+        })
+
+    for line in _lines(root, "free_time_cluster.log"):
+        _, flags, kv, _body = _split(line)
+        scope = SYSTEM if "SYSTEM" in flags else cluster_label(kv.get("cluster", ""))
+
+        if "MACHINE" in flags and "machine" in kv:
+            data.machines.append({
+                "machine": kv["machine"],
+                "devices": num(kv.get("devices")),
+                "free": num(kv.get("free")),
+                "free_s": num(kv.get("free_s")),
+                "span_s": num(kv.get("span_s")),
+                "merge_slop_s": num(kv.get("merge_slop_s")),
+                "host_idle": num(kv.get("host_idle")),
+            })
+        elif "FREE" in flags and "reason" in kv and scope:
+            data.free_reasons[(scope, kv["reason"])] = {
+                key: num(kv.get(key)) for key in ("free_s", "share") if key in kv
+            }
+        elif "KIND" in flags and "kind" in kv and scope:
+            data.free_kinds[(scope, kv["kind"])] = {
+                key: num(kv.get(key)) for key in ("busy_s", "share") if key in kv
+            }
+        elif scope:
+            data.free_time[(scope, kv.get("role", "all"))] = {
+                key: num(kv.get(key))
+                for key in ("free", "free_mean", "free_s", "span_s", "devices",
+                            "clusters", "machines")
+                if key in kv
+            }
+
+
+def read_free_series(root: Path, data: RunData) -> None:
+    """`free_time_series.log` §2.12 — when each device was idle.
+
+    `t_offset_s` is on the **device's own** clock, not the server's. Two rows
+    with the same offset are not the same instant, which is why this series is
+    the one thing here an analysis window cannot cut (`WHOLE_RUN_ONLY`).
+    """
+    rows: dict[str, list[tuple[float, float]]] = {}
+    for line in _lines(root, "free_time_series.log"):
+        _, _, kv, _body = _split(line)
+        client = kv.get("client", "")
+        at, value = num(kv.get("t_offset_s")), num(kv.get("free"))
+        if not client or not (math.isfinite(at) and math.isfinite(value)):
+            continue
+        rows.setdefault(client, []).append((at, value))
+        data.free_series_meta.setdefault(client, {
+            "role": kv.get("role", "unknown"),
+            "machine": kv.get("machine", ""),
+            "cluster": cluster_label(kv.get("cluster", "")),
+            # Carried on every line rather than assumed, so a long run may
+            # widen its buckets without breaking a reader that cached the old
+            # width. Kept as text: it is a label, not a measurement.
+            "bucket_s": kv.get("bucket_s", ""),
+        })
+
+    for client, samples in rows.items():
+        samples.sort(key=lambda row: row[0])
+        data.free_series[client] = [
+            Point(index=i, at=at, value=value)
+            for i, (at, value) in enumerate(samples)
+        ]
+
+
+def read_broker(root: Path, data: RunData) -> None:
+    """`broker_ram_ns.log` §2.13 and `broker_ram.log` §2.14.
+
+    The queue host runs nothing of ours, so this is the one measurement pulled
+    from outside rather than reported by a process we wrote -- and the only one
+    whose *source* has to travel with the number. `source=ssh` is host memory,
+    `MemTotal - MemAvailable`, every process on the box; `source=rabbitmq_api`
+    is the management-API fallback and describes the broker process alone.
+    """
+    rows: list[tuple[int, dict[str, float]]] = []
+    for line in _lines(root, "broker_ram_ns.log"):
+        ts, _, kv, _body = _split(line)
+        if ts is None or "used_mb" not in kv:
+            continue
+        data.broker_host = data.broker_host or kv.get("host", "")
+        data.broker_source = data.broker_source or kv.get("source", "")
+        sample = {
+            key: num(kv.get(key))
+            for key in ("total_mb", "used_mb", "used", "avail_mb", "free_mb",
+                        "cached_mb", "swap_used_mb")
+        }
+        # `rabbit_rss_mb` in the reference instance; the guide is explicit that
+        # the noun is the project's own, so the suffix is what is matched.
+        sample["rss_mb"] = next(
+            (num(v) for k, v in kv.items() if k.endswith("_rss_mb")), math.nan
+        )
+        rows.append((ts, sample))
+
+    # The same clock as the batch completions, which is the entire point: RAM
+    # climbing while throughput falls is the backpressure signature, and it is
+    # only legible if the two curves are read against one x axis.
+    clock = data.base_ns if data.base_ns is not None else (rows[0][0] if rows else None)
+    if clock is not None:
+        data.broker_samples = [
+            dict(sample, at=(ts - clock) / 1e9) for ts, sample in rows
+        ]
+
+    for line in _lines(root, "broker_ram.log"):
+        _, flags, kv, body = _split(line)
+        kind = next((f for f in flags if f in ("BROKER", "USED", "DELTA", "RABBIT")), "")
+        if not kind:
+            continue
+        data.broker[kind] = {
+            key: num(value) for key, value in kv.items()
+            if math.isfinite(num(value))
+        }
+        if kind != "BROKER":
+            continue
+        data.broker_host = kv.get("host", data.broker_host)
+        data.broker_source = kv.get("source", data.broker_source)
+        if num(kv.get("samples")) == 0:
+            reason = _REASON.search(body)
+            data.broker_note = reason.group(1) if reason else "no samples were taken"
+            # Said out loud rather than left as a chart that quietly did not
+            # draw: a run where the queue host was fine and a run where it
+            # could not be reached look identical from the missing figure.
+            data.warnings.append(
+                f"the queue host was not sampled: {data.broker_note}. Its RAM "
+                "charts are not drawn — this is not a report that the host was "
+                "fine"
+            )
+
+
 def read_cuts(root: Path, data: RunData) -> None:
     """`cut_change_ns.log` §2.9 — adaptive runs only, and stale in other tags.
 
@@ -482,6 +716,10 @@ WHOLE_RUN_ONLY = (
     "device utilization (only a cumulative busy/total per device was written)",
     "service, pipeline and end-to-end latency (only n/mean/p50/p95/max)",
     "accuracy over all frames (only the finished per-frame match)",
+    "free time per device, per machine and per reason (only a merged total)",
+    "free time over the run (bucketed on each device's own clock, which the "
+    "system's window cannot be measured against)",
+    "the queue host's RAM summary (only min/mean/p50/p95/max over the samples)",
 )
 
 
@@ -625,6 +863,13 @@ def apply_window(data: RunData, window: Window) -> RunData:
         c: [at for at in stamps if inside(at)] for c, stamps in data.cluster_batches.items()
     }
     data.cuts = [c for c in data.cuts if inside(float(c.get("at", math.nan)))]
+    # Sampled by the server on the server's clock, so this is a series like any
+    # other and is cut with the rest. `free_time_series.log` deliberately is
+    # not: its offsets are each device's own, and filtering those on the
+    # system's span would hand every device a different stretch of the run.
+    data.broker_samples = [
+        s for s in data.broker_samples if inside(float(s.get("at", math.nan)))
+    ]
 
     recompute(data, span)
     return data
@@ -685,7 +930,8 @@ def read_run(root: Path, window: Window | None = None) -> RunData:
     data.files = sorted(p.name for p in root.iterdir() if p.is_file())
 
     for reader in (read_config, read_throughput, read_system_fps, read_cluster_fps,
-                   read_utilization, read_latency, read_accuracy, read_cuts):
+                   read_utilization, read_latency, read_accuracy, read_free_time,
+                   read_free_series, read_broker, read_cuts):
         try:
             reader(root, data)
         except Exception as exc:  # noqa: BLE001 - a broken log is not a broken report
