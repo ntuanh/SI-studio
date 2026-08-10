@@ -1026,13 +1026,16 @@ Write this table into the notebook's opening markdown cell. It is how a reader
 | `free_time_series.log` | free % per device per time bucket | 15 |
 | `broker_ram_ns.log` | queue-host RAM samples on the run clock | 16 |
 | `broker_ram.log` | queue-host RAM summary | 17 |
+| `message_size_series.log` | bytes per published message, one worker | 18 |
+| `message_size.log` | per-message size summary | 19 |
 | *(derived)* | headline metrics from several files | C11 |
 
-C1–C11 are the recipes in Part II. 11–17 are the diagnostic charts in
-`runcharts.py` that the last five inputs feed: 11 is the queue wait that
-`kind=pipeline` makes visible, 12–15 are free time, 16–17 are the queue host.
-The last five inputs are optional and arrive in two all-or-nothing groups, so a
-run draws all of a group's charts or none of them — never a partial set.
+C1–C11 are the recipes in Part II. 11–19 are the diagnostic charts in
+`runcharts.py` that the last seven inputs feed: 11 is the queue wait that
+`kind=pipeline` makes visible, 12–15 are free time, 16–17 are the queue host,
+18–19 are what one worker put on the wire. Those seven inputs are optional and
+arrive in three all-or-nothing groups, so a run draws all of a group's charts
+or none of them — never a partial set.
 
 If an input feeds nothing, either chart it or say in the notebook why not.
 

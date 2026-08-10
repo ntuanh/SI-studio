@@ -145,21 +145,28 @@ diagnostics, drawn only when the run measured what they need:
 | 15 Free time over the run | *When* was each device idle? | `free_time_series.log` |
 | 16 Queue-host RAM over the run | Did the broker back up while throughput fell? | `broker_ram_ns.log` |
 | 17 Queue-host RAM profile | How close to full, and what did the run leave behind? | `broker_ram.log` |
+| 18 Message size over the run | Was the payload steady, or does it move with the scene? | `message_size_series.log` |
+| 19 Message size per message | How big is one payload, and how much does it vary? | `message_size.log` |
 
-Free time and queue-host RAM are optional, all-or-nothing features: a run either
-writes all of a group's files or none, so you get a whole group of cards or no
-card from it. Numbering is fixed, so a run that measured neither still has 07
-meaning utilization — the gap is left rather than closed.
+Free time, queue-host RAM and message size are optional, all-or-nothing
+features: a run either writes all of a group's files or none, so you get a whole
+group of cards or no card from it. Numbering is fixed, so a run that measured
+none of them still has 07 meaning utilization — the gap is left rather than
+closed.
 
-Two of these are easy to misread, so the cards say it outright. **Free time is
+Three of these are easy to misread, so the cards say it outright. **Free time is
 not `1 − utilization`**: utilization is `busy / total` over one lane's unit
 window, free time is the whole run minus every lane's busy intervals merged, so
 a wait inside the unit window counts as busy for one and free for the other.
 They do not sum to 100%, and where they disagree loudly the gap *is* the
-finding. And **the queue host's RAM carries its source**: `ssh` is host memory
+finding. **The queue host's RAM carries its source**: `ssh` is host memory
 across every process on the box, `rabbitmq_api` is the broker process alone. A
 figure without that label is a plausible number meaning something other than
-what it says.
+what it says. And **message size is one worker's**, not the fleet's — exactly
+one worker is told to measure, because every worker in a group publishes the
+same payload shape from the same split point. Its card carries the split point
+and the compression setting, since the same worker with compression off is a
+different number entirely.
 
 ### Charting part of a run
 
@@ -195,6 +202,7 @@ comparison that is not in the data.
 | Accuracy over all frames | the finished per-frame match |
 | Free time, per device, machine and reason | a merged total per device |
 | The queue host's RAM summary | min / mean / p50 / p95 / max over the samples |
+| Message size, per message and in total | the finished statistics |
 
 There is no per-batch series behind any of them, so nothing here can re-add
 them over a slice. Those charts and the stat tiles above the gallery are
@@ -202,13 +210,16 @@ labelled **whole run**; the narrowed ones name their window. Both directions
 are marked — if only the windowed ones were, an unmarked chart would read as
 windowed too.
 
-Free time *over the run* is the one series that stays whole-run anyway. Its
-buckets are stamped on each device's own clock rather than the server's, and
-devices do not start together — so two buckets with the same offset are not the
-same moment, and there is nothing for a span of the system's clock to be
-measured against. That card says so, rather than saying "whole run" and leaving
-you to wonder which of the two reasons applies. The queue host's RAM *series*
-is sampled by the server, so it is cut like any other series.
+Two series stay whole-run for a different reason: free time over the run, and
+message size over the run. Both are stamped with offsets from the measuring
+device's own first event rather than the server's clock, and devices do not
+start together — so two samples sharing an offset are not the same moment, and
+there is nothing for a span of the system's clock to be measured against. Those
+cards say *that*, rather than saying "whole run" and leaving you to wonder which
+reason applies. Card 18 also drops its throughput companion panel on a windowed
+report, since a cut throughput curve beside an uncut size curve would be two
+different stretches of the run drawn on one x axis. The queue host's RAM
+*series* is sampled by the server, so it is cut like any other series.
 
 One consequence worth knowing: mAP is only scored over frames that have ground
 truth, which can be a short stretch near the start. If your window holds none

@@ -65,12 +65,14 @@ Nine every run writes, plus five a run writes only when it measured the thing.
 | `free_time_series.log` | free-time collector | shutdown | one line per device per time bucket | optional |
 | `broker_ram_ns.log` | the RAM sampler | live | one line per sample of the queue host | optional |
 | `broker_ram.log` | the RAM sampler | shutdown | `BROKER` / `USED` / `DELTA` / `RABBIT` | optional |
+| `message_size.log` | the measured worker | shutdown | one line per measured worker (normally one) | optional |
+| `message_size_series.log` | the measured worker | shutdown | one line per published message | optional |
 
-**The two optional features are all-or-nothing.** `free_time*` is one feature of three files
-(§2.10–2.12) and `broker_ram*` is one feature of two (§2.13–2.14) — a run emits all of a
-feature's files or none of them. Absence means "this run did not measure it", which is not a
-fault and is not warned about; what *is* worth reporting is an attempt that failed, and §2.14
-has a line kind for exactly that.
+**The three optional features are all-or-nothing.** `free_time*` is one feature of three files
+(§2.10–2.12), `broker_ram*` is one feature of two (§2.13–2.14), and `message_size*` is one
+feature of two (§2.15–2.16) — a run emits all of a feature's files or none of them. Absence
+means "this run did not measure it", which is not a fault and is not warned about; what *is*
+worth reporting is an attempt that failed, and §2.14 has a line kind for exactly that.
 
 ### 2.1 `batch_done_ns.log` — system throughput series
 
@@ -402,6 +404,90 @@ headroom question — compare against `unit_size × max_queue_depth`) → `USED 
 > with the reason in trailing parentheses: `samples=0 (permission denied)`. A missing file is
 > indistinguishable from a run where the host was fine; that line is not, and it is surfaced as a
 > report warning rather than as a chart that quietly did not draw.
+
+### 2.15 `message_size.log` — what one worker puts on the wire (optional)
+
+Every other file here measures *time*. This one measures **bytes**: the size of the payload a
+worker hands to the transport, taken on the worker, once per published message.
+
+It is what makes three of the others readable. Utilization (§2.4) says a worker was busy; this
+says whether it was busy computing or busy shipping. The queue host's memory curve (§2.13) shows
+the queue filling; message size × queue depth says whether that is the payload or something else.
+And a `send`-dominated free-time profile (§2.11) means nothing until you know how many bytes each
+send moved.
+
+```
+1786366279200770600 client=machine-2 role=edge machine=machine-2 cluster=intermediate_queue_0 mode=split splits=5 compress=on num_bit=8 batch_size=32 n=504 total_mb=19657.464 mean_mb=39.003 p50_mb=39.022 p95_mb=39.613 max_mb=40.098 min_mb=37.909 span_s=714.260 rate_mb_s=27.521 per_frame_mb=1.2188
+```
+
+| Key | Meaning |
+|---|---|
+| `n` | messages this worker published |
+| `total_mb` | bytes it put on the wire over the whole run |
+| `mean_mb`, `p50_mb`, `p95_mb`, `max_mb`, `min_mb` | per-message size. Percentiles **nearest-rank over the raw samples**, no interpolation — same rule as §2.6 |
+| `span_s` | first publish → last publish, on that worker's clock |
+| `rate_mb_s` | `total_mb / span_s` — this worker's egress, to compare against its share of the link |
+| `per_frame_mb` | `mean_mb / batch_size`, so runs with different batch sizes compare |
+| context keys | `mode`, `splits`, `compress`, `num_bit`, `batch_size` — whatever determines the size |
+
+**Exactly one worker measures**, and the server picks it: the first worker that registered at the
+first stage. Registration order needs no configuration, is stable within a run, and is already
+known before any work is dispatched; the first stage is the one whose output crosses the network,
+and every worker in a group publishes the same payload shape from the same split point — so nine
+measuring produce one number nine times at nine times the cost. **The worker never decides this
+for itself**: the flag travels in the dispatch message, so the job cannot land on two machines or
+on none.
+
+Two details the number depends on:
+
+- **The size is recorded before the publish call**, not after. Both orderings look equivalent
+  until the transport blocks — and a broker at its high-water mark, or a saturated link stalling
+  mid-write, are exactly the runs this exists to explain. Measured after, the sample for the
+  message that stalled is written late, or never.
+- **Serialized bytes** — what the transport is handed, after your own compression and framing,
+  before the transport's own. A pre-serialization tensor size is a different quantity.
+
+**The context keys are not optional decoration.** The same worker at the same split point with
+compression off is a different number entirely, so a size without them is unreproducible.
+
+Size keys use **MB = 10⁶ bytes**, matching §2.13, so a payload size and the host's memory growth
+compare without a conversion in between.
+
+### 2.16 `message_size_series.log` — message size over the run (optional)
+
+One line per published message — the plottable series behind the summary above.
+
+```
+1786366279200770600 client=machine-2 cluster=intermediate_queue_0 i=0 t_offset_s=0.000 batch_id=0 bytes=38897647 mb=38.898
+```
+
+| Key | Meaning |
+|---|---|
+| col 1 | ns-epoch arrival of the report at the **server**, identical on every line of a report |
+| `i` | sample index |
+| `t_offset_s` | seconds since **that worker's own first publish** |
+| `bytes` | exact integer — the authoritative value |
+| `mb` | the same number in MB, for readers that plot without converting |
+
+- Both columns on purpose: `bytes` is exact and `mb` keeps the file readable, and a reader that
+  rounds its own MB from `bytes` still agrees with the summary. **Read `bytes`.**
+- Sample times are **offsets**, never absolute device timestamps: the server writes this into a
+  shared result file, and every absolute timestamp in a shared file is the server's own clock.
+  Offsets are computed within one device, so they are exact and locate a sample in the run without
+  ever being compared against another machine's clock — and, like §2.12, that is why a window on
+  the system's clock leaves this series whole.
+- A long run decimates the shipped series **evenly** rather than truncating, so it still spans the
+  whole run. The summary statistics are computed over the **full** sample set: decimation may
+  coarsen a plot, never a number.
+
+**Reading it.** `mean_mb` × the queue depth cap is the RAM the queue host must hold — compare
+against `DELTA peak_over_start_mb` in §2.14; when the host's peak is far larger, something is
+buffering you did not account for. `rate_mb_s` × the workers sharing the link is offered load,
+the first check on whether the network or the compute is the bottleneck. `max_mb` against the
+transport's message-size limit is usually why a run at a deeper split point died. A wide
+`p95 / p50` means the payload varies with content, which makes any single-number bandwidth
+estimate optimistic. And the series against `batch_done_ns.log`: size flat while throughput falls
+is a transport problem, size climbing is a workload one.
 
 ---
 

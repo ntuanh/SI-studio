@@ -852,12 +852,28 @@ LATENCY_WITH_PIPELINE = LATENCY_CLUSTER + """\
 1785128504874248492 cluster=intermediate_queue_0 role=edge kind=pipeline n=336 mean_ms=342.576 p50_ms=336.640 p95_ms=409.440 max_ms=481.920
 """
 
+# Bytes, not seconds. Exactly one worker measures — the first registered at
+# the first stage — and the context keys travel with the number because a size
+# without them is unreproducible.
+MESSAGE_SIZE = """\
+1785128504880000000 client=machine-2 role=edge machine=machine-2 cluster=intermediate_queue_0 mode=split splits=5 compress=on num_bit=8 batch_size=32 n=20 total_mb=788.550 mean_mb=39.428 p50_mb=39.428 p95_mb=40.688 max_mb=40.958 min_mb=37.898 span_s=57.000 rate_mb_s=13.834 per_frame_mb=1.2321
+"""
+
+MESSAGE_SIZE_SERIES = "\n".join(
+    f"1785128504880000000 client=machine-2 cluster=intermediate_queue_0 i={i} "
+    f"t_offset_s={i * 3.0:.3f} batch_id={i} bytes={37_898_000 + i * 161_000} "
+    f"mb={(37_898_000 + i * 161_000) / 1e6:.3f}"
+    for i in range(20)
+) + "\n"
+
 EXTRA_FILES = {
     "free_time.log": FREE_TIME,
     "free_time_cluster.log": FREE_TIME_CLUSTER,
     "free_time_series.log": FREE_TIME_SERIES,
     "broker_ram_ns.log": BROKER_RAM_NS,
     "broker_ram.log": BROKER_RAM,
+    "message_size.log": MESSAGE_SIZE,
+    "message_size_series.log": MESSAGE_SIZE_SERIES,
     "latency_cluster.log": LATENCY_WITH_PIPELINE,
 }
 
@@ -971,10 +987,10 @@ def test_the_diagnostics_are_drawn_when_the_run_measured_them(
     assert [c.id for c in charts][10:] == [
         "queue_wait", "device_free_time", "free_time_breakdown",
         "machine_free_time", "free_time_series", "broker_ram_timeline",
-        "broker_ram_profile",
+        "broker_ram_profile", "message_size_series", "message_size",
     ]
     assert by_id["queue_wait"].file.startswith("11_")
-    assert by_id["broker_ram_profile"].file.startswith("17_")
+    assert by_id["message_size"].file.startswith("19_")
     assert all((tmp_path / "imgs" / c.file).is_file() for c in charts)
     # Every one of them offers something to switch off, and says what it is.
     assert all(c.series and all(s.label for s in c.series) for c in charts)
@@ -1061,3 +1077,103 @@ def test_the_optional_tiles_carry_their_source_and_their_alarm(full_run: Path) -
     # Swap was held, so the tile is flagged — and says why, never color alone.
     assert by_label["Queue-host RAM peak"].delta_kind == "bad"
     assert "swap" in by_label["Queue-host RAM peak"].delta
+    # One worker's egress, never a fleet total, and the label says so.
+    assert by_label["Payload per message"].value == "39.4"
+    assert by_label["Payload per message"].source.endswith("· one worker")
+    assert "MB/s egress" in by_label["Payload per message"].delta
+
+
+def test_message_size_reads_one_workers_bytes(full_run: Path) -> None:
+    """§2.15: the size, the settings it is a size *of*, and the per-message series."""
+    data = runlog.read_run(full_run)
+
+    assert len(data.message_size) == 1
+    worker = data.message_size[0]
+    assert worker["mean_mb"] == 39.428
+    assert worker["n"] == 20
+    assert worker["rate_mb_s"] == 13.834
+    # Kept as written: `compress=on` is a caption, not a measurement.
+    assert worker["context"] == {
+        "mode": "split", "splits": "5", "compress": "on",
+        "num_bit": "8", "batch_size": "32",
+    }
+    assert [p.at for p in data.message_series["machine-2"]] == [
+        i * 3.0 for i in range(20)
+    ]
+
+
+def test_the_size_comes_from_bytes_not_the_convenience_column(tmp_path: Path) -> None:
+    """`bytes` is authoritative; `mb` only keeps the file readable.
+
+    Reading `mb` would put the curve and the summary a rounding apart, and MB
+    here is 10^6 bytes so the payload compares straight against the queue
+    host's memory.
+    """
+    directory = write_run(tmp_path, **{
+        **EXTRA_FILES,
+        "message_size_series.log": "\n".join(
+            f"1785128504880000000 client=machine-2 cluster=intermediate_queue_0 "
+            f"i={i} t_offset_s={i * 3.0:.3f} batch_id={i} bytes=39000000 mb=0.001"
+            for i in range(20)
+        ) + "\n",
+    })
+
+    points = runlog.read_run(directory).message_series["machine-2"]
+    assert all(p.value == 39.0 for p in points)
+
+
+def test_two_measuring_workers_is_a_bug_that_is_said_out_loud(tmp_path: Path) -> None:
+    """Invariant 1: the server picks one worker and tells it in the dispatch.
+
+    Two reporting workers reads as a richer chart rather than as a fault, so
+    the lines are all drawn and the report says the count is wrong.
+    """
+    directory = write_run(tmp_path, **{
+        **EXTRA_FILES,
+        "message_size.log": MESSAGE_SIZE + MESSAGE_SIZE.replace(
+            "client=machine-2", "client=machine-3"),
+    })
+    data = runlog.read_run(directory)
+
+    assert len(data.message_size) == 2
+    assert any("exactly one should be told to measure" in w for w in data.warnings)
+
+
+def test_message_size_over_the_run_is_on_the_workers_own_clock(
+    full_run: Path, tmp_path: Path
+) -> None:
+    """Offsets from that worker's first publish — not the run's first completion.
+
+    So a window leaves it whole, and the throughput companion panel is dropped
+    rather than drawn over a different stretch of the run than the size curve.
+    """
+    whole, _, _ = render(full_run, tmp_path / "whole")
+    by_id = {c.id: c for c in whole}
+    assert "throughput" in [s.key for s in by_id["message_size_series"].series]
+    assert "share a shape, not an origin" in by_id["message_size_series"].subtitle
+
+    part, _, _ = chartmod.render(
+        parsemod.parse_tree(full_run), tmp_path / "part",
+        source_dir=full_run, window=Window(5, 90),
+    )
+    windowed = {c.id: c for c in part}["message_size_series"]
+    assert "throughput" not in [s.key for s in windowed.series]
+    assert "measuring device's own clock" in windowed.subtitle
+    # The summary is one finished total, so it is whole-run for the usual reason.
+    assert "whole run — the run wrote only a finished total" in {
+        c.id: c for c in part}["message_size"].subtitle
+
+
+def test_the_size_charts_carry_the_settings_they_are_a_size_of(
+    full_run: Path, tmp_path: Path
+) -> None:
+    """A payload size without its split point and compression is unreproducible."""
+    charts, _, _ = render(full_run, tmp_path / "imgs")
+    profile = next(c for c in charts if c.id == "message_size")
+
+    for part in ("split", "5 splits", "compress on", "8 bit"):
+        assert part in profile.subtitle, part
+    # Bars, so the scale is anchored at zero — length is the encoding here.
+    assert [s.key for s in profile.series] == [
+        "min_mb", "p50_mb", "mean_mb", "p95_mb", "max_mb",
+    ]

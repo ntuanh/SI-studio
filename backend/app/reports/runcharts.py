@@ -20,11 +20,13 @@ order:
 | `free_time_series.log` | 15 free time over the run |
 | `broker_ram_ns.log` | 16 the queue host's RAM against throughput |
 | `broker_ram.log` | 17 the RAM profile and what the run added |
+| `message_size_series.log` | 18 what one worker put on the wire, over the run |
+| `message_size.log` | 19 the per-message size profile |
 | *(derived)* | the stat tiles (C12) |
 
-01-10 are the story every run tells. 11-17 are the diagnostics: one latency
-comparison the first ten do not draw, and the two optional features
-(§2.10-2.14) a run either measures or does not.
+01-10 are the story every run tells. 11-19 are the diagnostics: one latency
+comparison the first ten do not draw, and the three optional features
+(§2.10-2.16) a run either measures or does not.
 
 Chart numbers are fixed rather than sequential. A run with no `map.log` leaves
 the 09/10 gap instead of renumbering, so a note saved against "07" keeps
@@ -1331,6 +1333,235 @@ def broker_ram_profile(canvas: Canvas, data: RunData, view: View) -> Chart | Non
         view, title=title, ylabel="Memory (MB)", shown=shown), index=17)
 
 
+def _size_context(row: dict[str, object]) -> str:
+    """`split · 5 splits · compress on · 8 bit` — the settings the size is of.
+
+    A payload size without them is unreproducible: the same worker at the same
+    split point with compression off is a different number entirely.
+    """
+    context = row.get("context") or {}
+    names = {"mode": "", "splits": " splits", "compress": "compress ",
+             "num_bit": " bit", "batch_size": " per batch"}
+    parts = []
+    for key, affix in names.items():
+        if key not in context:
+            continue
+        value = context[key]
+        parts.append(f"{affix}{value}" if affix.endswith(" ") else f"{value}{affix}")
+    return " · ".join(parts)
+
+
+# ------------------------------------------------- 18 · message size in time
+def message_size_over_run(canvas: Canvas, data: RunData, view: View) -> Chart | None:
+    """What one worker actually put on the wire, message by message.
+
+    Only one worker measures — every worker in a group publishes the same
+    payload shape from the same split point, so this is that shape over time
+    rather than a fleet total. The x axis is seconds since **that worker's own
+    first publish**, which is not the run's first completion; the throughput
+    panel underneath is read for its *shape*, not aligned instant to instant.
+
+    Flat size while throughput falls is a transport problem; size climbing is a
+    workload one (§2.16).
+    """
+    series = {c: p for c, p in sorted(data.message_series.items()) if len(p) >= 8}
+    if not series:
+        return None
+    if len(series) > len(pal.SLOTS_LIGHT):
+        series = dict(list(series.items())[: len(pal.SLOTS_LIGHT)])
+
+    single = len(series) == 1
+    colors = entity_colors(list(series))
+    summaries = {str(r.get("client", "")): r for r in data.message_size}
+    values = np.array([p.value for p in next(iter(series.values()))], dtype=float)
+    mean = float(np.mean(values))
+    # The raw readings are only worth a second line when a rolling mean is
+    # drawn over them. Without one they *are* the series, and offering
+    # "Reading" beside a line that is the same numbers would be two names for
+    # one thing in the config panel.
+    smoothing = stable_smooth(len(values), len(values))
+
+    # The companion panel is only honest on a whole-run report: the size series
+    # cannot be cut to a window (its offsets are the worker's own clock) and a
+    # windowed throughput curve beside an uncut size curve would be two
+    # different stretches of the run drawn as one x axis.
+    offer_fps = bool(data.system_fps) and data.window.whole
+    shown = Shown(view, [
+        *([("reading", "Reading", TINT)] if single and smoothing else []),
+        *[(client, client or "worker", colors[client]) for client in series],
+        *([("average", f"Run mean ({mean:.1f} MB)", S1)] if single else []),
+        *([("throughput", "System throughput", pal.SLOTS_LIGHT[3])] if offer_fps else []),
+    ])
+    workers = [r for r in shown if r.key in series]
+    with_fps = shown.has("throughput") and offer_fps
+    if not workers:
+        return None
+
+    heights = [2.6, 1.5] if with_fps else [2.6]
+    fig, axes = plt.subplots(len(heights), 1, figsize=(11.5, 1.55 * sum(heights)),
+                             sharex=True, squeeze=False,
+                             gridspec_kw=dict(height_ratios=heights))
+    panels = list(axes[:, 0])
+    top = panels[0]
+
+    everything: list[float] = []
+    for ref in workers:
+        points = series[ref.key]
+        x = np.array([p.at for p in points], dtype=float)
+        y = np.array([p.value for p in points], dtype=float)
+        everything.extend(y)
+        # This series is never cut by a window, so its own length *is* the
+        # full count the smoothing width is chosen from.
+        window = stable_smooth(len(y), len(y))
+        if shown.has("reading"):
+            top.plot(x, y, color=TINT, label="reading", linewidth=1.4,
+                     solid_capstyle="round")
+        # The worker's line is always drawn in the worker's own color, smoothed
+        # or not, so the endpoint dot can never be the only mark wearing it.
+        line = rolling_mean(y, window) if window else y
+        top.plot(x, line, color=ref.color, label=ref.label, **LINE_KW)
+        last = float(line[-1])
+        _endpoint(top, float(x[-1]), last, ref.color, f"{last:.1f}")
+
+    if shown.has("average"):
+        # Reference line: same hue, thinner, receding (§C3).
+        top.axhline(mean, color=S1, linewidth=1.0, alpha=0.45)
+        top.annotate(f"mean {mean:.1f} MB", xy=(0.008, mean),
+                     xycoords=("axes fraction", "data"), xytext=(0, 5),
+                     textcoords="offset points", fontsize=9, color=INK_2)
+
+    ylabel = "Message size (MB)"
+    view.label_axes(top, y=ylabel)
+    # A level, not a magnitude read off its length: a payload that hovers
+    # around 39 MB has its whole story in the ±3 MB it moves, and a zero
+    # baseline squeezes that into a sliver at the top of the panel. `band` is
+    # what the guide reserves for exactly this, and the mean reference line is
+    # what keeps the truncated axis honest.
+    band(top, everything, pad=0.14, top_pad=0.14)
+    tidy(top)
+
+    if with_fps:
+        ax = panels[-1]
+        fy = np.array([p.value for p in data.system_fps], dtype=float)
+        smoothing = stable_smooth(len(fy), data.full_counts.get("system", 0))
+        ax.plot([p.at for p in data.system_fps],
+                rolling_mean(fy, smoothing) if smoothing else fy,
+                color=pal.SLOTS_LIGHT[3], **LINE_KW)
+        ax.set_ylabel("FPS", fontsize=10.5, color=INK_2)
+        headroom(ax, fy, 1.12)
+        tidy(ax)
+
+    title = "Message size over the run"
+    xlabel = "seconds since the measuring worker's first publish"
+    panels[-1].set_xlabel(view.xlabel or xlabel)
+    left = min(p.at for points in series.values() for p in points)
+    right = max(p.at for points in series.values() for p in points)
+    panels[-1].set_xlim(left, right + (right - left) * 0.05)
+    # The curve now fills its panel, so a legend inside it lands on a mark
+    # wherever it is put. Above the panels it cannot collide with anything.
+    legend = len(top.get_legend_handles_labels()[0]) > 1
+    suptitle(fig, view.titled(title), y=1.10 if legend else 1.02)
+    if legend:
+        panel_legend(fig, top, ncol=len(shown))
+
+    worker = summaries.get(next(iter(series)), {})
+    context = _size_context(worker) if worker else ""
+    return canvas.save(fig, applied(Chart(
+        id="message_size_series", file="", kind="trend", title=title,
+        subtitle=("measured on one worker, before the publish call"
+                  + (f" · {context}" if context else "")
+                  + (" · the panels share a shape, not an origin — these "
+                     "offsets start at the worker's first publish, the run's "
+                     "clock at its first completion" if with_fps else "")),
+        summary="; ".join(
+            f"{client or 'worker'} {len(points)} messages, "
+            f"{np.mean([p.value for p in points]):.1f} MB mean, "
+            f"{max(p.value for p in points):.1f} MB peak"
+            for client, points in series.items()),
+        metrics=["mb", "bytes"]),
+        view, title=title, xlabel=xlabel, ylabel=ylabel, shown=shown), index=18)
+
+
+# ------------------------------------------------- 19 · message size profile
+def message_size_profile(canvas: Canvas, data: RunData, view: View) -> Chart | None:
+    """Per-message size: the spread, not just the average.
+
+    A wide `p95 / p50` on a fixed split point means the payload depends on
+    content — compression ratio varying with the scene — which makes any
+    single-number bandwidth estimate optimistic. The totals are single numbers
+    and go to the tiles rather than becoming one-bar bar charts (§2.15).
+
+    Percentiles are nearest-rank over the raw samples, so every bar is a size
+    that actually occurred.
+    """
+    rows = [r for r in data.message_size
+            if math.isfinite(float(r.get("mean_mb", math.nan)))]
+    if not rows:
+        return None
+    if len(rows) > len(pal.SLOTS_LIGHT):
+        rows = rows[: len(pal.SLOTS_LIGHT)]
+
+    shown = Shown(view, [("min_mb", "Min", S1), ("p50_mb", "p50", S1),
+                         ("mean_mb", "Mean", S1), ("p95_mb", "p95", S1),
+                         ("max_mb", "Max", S1)])
+    every = [float(r.get(ref.key, math.nan)) for r in rows for ref in shown]
+    x = np.arange(len(shown), dtype=float)
+
+    # One panel per measuring worker, sharing a scale: same measure, so they
+    # must be comparable. Normally there is exactly one.
+    fig, axes = plt.subplots(1, len(rows), figsize=(max(6.0, 4.6 * len(rows)), 4.2),
+                             sharey=True, squeeze=False)
+    for ax, row in zip(axes[0], rows):
+        values = [float(row.get(ref.key, math.nan)) for ref in shown]
+        bars = ax.bar(x, values, min(0.56, 2.2 / max(len(shown), 1)), color=S1, **BAR_KW)
+        label_bars(ax, bars, values, "{:,.1f}")
+        ax.set_xticks(x, shown.labels)
+        if len(rows) > 1:
+            ax.set_title(str(row.get("client") or row.get("machine") or "worker"))
+        tidy(ax, categorical="x")
+    headroom(axes[0][0], every, 1.16)
+
+    title = "Message size per published message"
+    ylabel = "Size (MB)"
+    view.label_axes(axes[0][0], y=ylabel)
+    suptitle(fig, view.titled(title))
+
+    head = rows[0]
+    p50, p95 = float(head.get("p50_mb", math.nan)), float(head.get("p95_mb", math.nan))
+    mean_mb = float(head["mean_mb"])
+    # The cross-file read of §2.15: the host's growth, priced in messages. It
+    # is the check on whether the queue holds what you think it holds.
+    peak = data.broker.get("DELTA", {}).get("peak_over_start_mb", math.nan)
+    if math.isfinite(peak) and mean_mb > 0:
+        note = (f"the queue host grew {peak:,.0f} MB over its baseline — "
+                f"{peak / mean_mb:.1f} messages' worth of buffering")
+    elif math.isfinite(p50) and math.isfinite(p95) and p50 > 0:
+        spread = p95 / p50
+        note = (f"p95 is {spread:.2f}× p50 — "
+                + ("the payload varies with content, so one bandwidth number "
+                   "is optimistic" if spread > 1.15 else
+                   "a steady payload, so mean egress is the whole story"))
+    else:
+        note = ""
+    if note:
+        takeaway(axes[0][len(rows) // 2], note)
+
+    context = _size_context(head)
+    return canvas.save(fig, applied(Chart(
+        id="message_size", file="", kind="distribution",
+        title=title,
+        subtitle=("serialized bytes handed to the transport, from one worker"
+                  + (f" · {context}" if context else "")),
+        summary="; ".join(
+            f"{r.get('client') or 'worker'} {fmt(r.get('n'))} messages, "
+            f"{float(r.get('mean_mb', math.nan)):,.1f} MB mean, "
+            f"{float(r.get('total_mb', math.nan)):,.0f} MB total at "
+            f"{float(r.get('rate_mb_s', math.nan)):,.1f} MB/s"
+            for r in rows),
+        metrics=["mean_mb", "p50_mb", "p95_mb", "max_mb", "min_mb"]),
+        view, title=title, ylabel=ylabel, shown=shown), index=19)
+
+
 # ------------------------------------------------------------------- tiles
 def tiles(data: RunData) -> list[Tile]:
     """C12 — the numbers that *are* the story, not one-bar bar charts.
@@ -1408,6 +1639,22 @@ def tiles(data: RunData) -> list[Tile]:
                    f"of {total:,.0f} MB installed" if math.isfinite(total) else ""),
             delta_kind="bad" if math.isfinite(swap) and swap > 0 else ""))
 
+    # Bytes, not seconds — the number that says whether a busy worker was busy
+    # computing or busy shipping. It is one worker's egress, never a fleet
+    # total, and the label says so.
+    payload = next((r for r in data.message_size
+                    if math.isfinite(float(r.get("mean_mb", math.nan)))), None)
+    if payload:
+        rate = float(payload.get("rate_mb_s", math.nan))
+        per_frame = float(payload.get("per_frame_mb", math.nan))
+        out.append(Tile(
+            label="Payload per message", value=f"{float(payload['mean_mb']):,.1f}",
+            unit="MB", source="message_size.log · one worker",
+            delta=" · ".join(part for part in (
+                f"{rate:,.1f} MB/s egress" if math.isfinite(rate) else "",
+                f"{per_frame:,.2f} MB/frame" if math.isfinite(per_frame) else "",
+            ) if part)))
+
     for key, label, unit in (("batch_size", "Batch size", ""),
                              ("num_bit", "Quantization", "bit"),
                              ("window_batches", "mAP window", "batches")):
@@ -1441,6 +1688,7 @@ CATALOGUE: tuple[Callable[[Canvas, RunData, View], Chart | None], ...] = (
     # first ten and stops, which is why they come after rather than between.
     queue_wait, device_free_time, free_time_breakdown, machine_free_time,
     free_time_over_run, broker_ram_timeline, broker_ram_profile,
+    message_size_over_run, message_size_profile,
 )
 
 
@@ -1459,6 +1707,12 @@ WINDOWED = frozenset({
     "map_by_window", "broker_ram_timeline",
 })
 RECOMPUTED = frozenset({"throughput_by_cluster"})
+
+#: Series the window leaves whole because they are not on its clock. They are
+#: stamped with an offset from the measuring device's own first event, and two
+#: rows sharing an offset are not the same instant — there is nothing here for
+#: a span of the *system's* clock to be measured against.
+OWN_CLOCK = frozenset({"free_time_series", "message_size_series"})
 
 
 def _note_window(chart: Chart, data: RunData) -> None:
@@ -1488,13 +1742,13 @@ def _note_window(chart: Chart, data: RunData) -> None:
                      "matched frame by frame over everything")
         else:
             scope = whole
-    elif chart.id == "free_time_series":
-        # A series the window still cannot cut: its offsets are each device's
-        # own clock, and the window is a span of the system's. Saying "whole
-        # run" alone would read as "the run only wrote a total", which is the
-        # wrong reason and would invite someone to go and fix it.
-        scope = (f"whole run — these buckets are on each device's own clock, "
-                 f"which the {label} window cannot be measured against")
+    elif chart.id in OWN_CLOCK:
+        # Series the window still cannot cut: their offsets are the measuring
+        # device's own clock, and the window is a span of the system's. Saying
+        # "whole run" alone would read as "the run only wrote a total", which
+        # is the wrong reason and would invite someone to go and fix it.
+        scope = (f"whole run — these offsets are on the measuring device's own "
+                 f"clock, which the {label} window cannot be measured against")
     elif chart.id in RECOMPUTED and "throughput" in data.recomputed:
         scope = f"recomputed over {label} of the run"
     elif chart.id in WINDOWED:
@@ -1566,4 +1820,6 @@ CHART_IDS: dict[str, str] = {
     "free_time_over_run": "free_time_series",
     "broker_ram_timeline": "broker_ram_timeline",
     "broker_ram_profile": "broker_ram_profile",
+    "message_size_over_run": "message_size_series",
+    "message_size_profile": "message_size",
 }

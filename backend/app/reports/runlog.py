@@ -49,13 +49,15 @@ FILES = (
     "map_window.log", "map.log", "cut_change_ns.log",
 )
 
-#: §2.10-2.14 — the two optional features, each all-or-nothing. Read when they
-#: are there and never missed when they are not: a run measures free time or it
-#: does not, and warning about their absence on every other run would train an
-#: operator to ignore the line that says a *required* file went missing.
+#: §2.10-2.16 — the three optional features, each all-or-nothing. Read when
+#: they are there and never missed when they are not: a run measures free time
+#: or it does not, and warning about their absence on every other run would
+#: train an operator to ignore the line that says a *required* file went
+#: missing.
 OPTIONAL = (
     "free_time.log", "free_time_cluster.log", "free_time_series.log",
     "broker_ram_ns.log", "broker_ram.log",
+    "message_size.log", "message_size_series.log",
 )
 
 #: Enough of them present to be sure. `fps_cluster.log` carries the headline
@@ -220,6 +222,21 @@ class RunData:
     #: indistinguishable from a run where the host was fine; "0 samples
     #: (permission denied)" is not.
     broker_note: str = ""
+
+    #: message_size.log — one row per *measured* worker, and normally that is
+    #: exactly one: the first worker that registered at the first stage, told
+    #: so by the server in its dispatch. Every worker in a group publishes the
+    #: same payload shape from the same split point, so nine measuring produce
+    #: one number nine times at nine times the cost. The bytes are the
+    #: **serialized** payload handed to the transport, and the context keys
+    #: (`compress`, `num_bit`, `splits`, `mode`) travel with it because a size
+    #: without them is unreproducible (§2.15).
+    message_size: list[dict[str, object]] = field(default_factory=list)
+    #: message_size_series.log — client -> one point per published message.
+    #: `at` is `t_offset_s`, seconds since **that worker's own first publish**,
+    #: never a device timestamp: the server writes this into a shared file, and
+    #: every absolute timestamp in a shared file is the server's own clock.
+    message_series: dict[str, list[Point]] = field(default_factory=dict)
 
     #: cut_change_ns.log — adaptive split-point moves, seconds into the run
     cuts: list[dict[str, object]] = field(default_factory=list)
@@ -643,6 +660,70 @@ def read_broker(root: Path, data: RunData) -> None:
             )
 
 
+def read_message_size(root: Path, data: RunData) -> None:
+    """`message_size.log` §2.15 and `message_size_series.log` §2.16.
+
+    The one measurement here in bytes rather than seconds, and the one that
+    makes three of the others readable: utilization says a worker was busy,
+    this says whether it was busy computing or busy shipping; the queue host's
+    memory curve shows the queue filling, this says whether that is the payload
+    or something else.
+    """
+    for line in _lines(root, "message_size.log"):
+        _, _, kv, _body = _split(line)
+        if "mean_mb" not in kv:
+            continue
+        row: dict[str, object] = {
+            key: num(kv.get(key))
+            for key in ("n", "total_mb", "mean_mb", "p50_mb", "p95_mb", "max_mb",
+                        "min_mb", "span_s", "rate_mb_s", "per_frame_mb")
+        }
+        row.update(
+            client=kv.get("client", ""),
+            role=kv.get("role", "unknown"),
+            machine=kv.get("machine", ""),
+            cluster=cluster_label(kv.get("cluster", "")),
+            # Kept as written rather than parsed: `compress=on` and `mode=split`
+            # are the settings the size is only meaningful against, and they
+            # are captions, not measurements.
+            context={key: kv[key] for key in
+                     ("mode", "splits", "compress", "num_bit", "batch_size")
+                     if key in kv},
+        )
+        data.message_size.append(row)
+
+    rows: dict[str, list[tuple[float, float]]] = {}
+    for line in _lines(root, "message_size_series.log"):
+        _, _, kv, _body = _split(line)
+        client = kv.get("client", "")
+        at = num(kv.get("t_offset_s"))
+        # `bytes` is the authoritative integer and `mb` the same number kept
+        # readable. Deriving MB from the integer keeps the curve agreeing with
+        # the summary rather than with somebody's rounding; MB is 10^6 bytes
+        # here, matching the queue host's memory so the two compare directly.
+        size = num(kv.get("bytes"))
+        value = size / 1e6 if math.isfinite(size) else num(kv.get("mb"))
+        if not client or not (math.isfinite(at) and math.isfinite(value)):
+            continue
+        rows.setdefault(client, []).append((at, value))
+
+    for client, samples in rows.items():
+        samples.sort(key=lambda row: row[0])
+        data.message_series[client] = [
+            Point(index=i, at=at, value=value)
+            for i, (at, value) in enumerate(samples)
+        ]
+
+    # Invariant 1 of §2.15, checked rather than assumed. Two reporting workers
+    # is a producer bug that reads as a richer chart, so it is said out loud.
+    if len(data.message_size) > 1 or len(data.message_series) > 1:
+        data.warnings.append(
+            f"{max(len(data.message_size), len(data.message_series))} workers "
+            "reported a message size; exactly one should be told to measure. "
+            "All of them are drawn — the sizes are per worker, not a fleet total"
+        )
+
+
 def read_cuts(root: Path, data: RunData) -> None:
     """`cut_change_ns.log` §2.9 — adaptive runs only, and stale in other tags.
 
@@ -720,6 +801,9 @@ WHOLE_RUN_ONLY = (
     "free time over the run (bucketed on each device's own clock, which the "
     "system's window cannot be measured against)",
     "the queue host's RAM summary (only min/mean/p50/p95/max over the samples)",
+    "message size, per message and in total (only the finished statistics)",
+    "message size over the run (offsets from the measuring worker's own first "
+    "publish, which the system's window cannot be measured against)",
 )
 
 
@@ -931,7 +1015,7 @@ def read_run(root: Path, window: Window | None = None) -> RunData:
 
     for reader in (read_config, read_throughput, read_system_fps, read_cluster_fps,
                    read_utilization, read_latency, read_accuracy, read_free_time,
-                   read_free_series, read_broker, read_cuts):
+                   read_free_series, read_broker, read_message_size, read_cuts):
         try:
             reader(root, data)
         except Exception as exc:  # noqa: BLE001 - a broken log is not a broken report
