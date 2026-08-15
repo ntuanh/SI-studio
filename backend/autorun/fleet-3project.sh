@@ -2,11 +2,20 @@
 # =============================================================================
 # Three projects, one queue: split -> PA -> dmsf, on the 13-host lab fleet.
 #
-# Combines run/guides/{split,PA,dmsf}.md into one unattended schedule. Each
-# project runs the SAME short video, already present on all 9 edges as
-#   ~/ntuanh/Optimizer/split_inference_test/video.mp4
-#   (8,268,922 B, md5 3478859f21d1163feb532fbf526d65fc, 905 frames @ 29.97fps)
-# and byte-identical at PA's and dmsf's own paths -- verified, not copied.
+# Combines run/guides/{split,PA,dmsf}.md into one unattended schedule.
+#
+# Each project reads its own video, from the path its own config.yaml names:
+#   split  ~/ntuanh/Optimizer/split_inference_test/video.mp4   (data: video.mp4)
+#   PA     ~/ntuanh/split_inference_test/video.mp4             (data: video.mp4)
+#   dmsf   ~/manh224353/split_inference/videos/video.mp4       (data: videos/video.mp4)
+#
+# These were once byte-identical, which is what made running the three back to
+# back a fair comparison. Nothing enforces that, and replacing one project's
+# video silently ends it -- so the size, md5 and frame count are MEASURED here
+# each run and reported, rather than asserted in a comment that goes stale the
+# first time someone swaps a file. A mismatch across projects is called out
+# loudly; a mismatch across the 9 edges of one project is a hard failure,
+# because then the run is not even internally consistent.
 #
 # Runs FROM the workstation: the 192.168.101.0/24 lab subnet is not routed here,
 # so every LAN session tunnels through dai (autorun/fleet.py). No credential is
@@ -70,17 +79,58 @@ kill_fleet() {
     2>&1 | grep -E "^=====|left=" | sed 's/^/     /'
 }
 
-# The video is the run's input; if an edge lost it the project silently produces
-# nothing, so check before spending 9 minutes finding out.
+# The video is the run's input. Three ways it goes wrong, in order of how
+# quietly: an edge lost it (the project produces nothing), the 9 edges disagree
+# (each one measures a different workload and the cluster numbers are noise), or
+# the projects disagree with each other (each result is fine, comparing them is
+# not). The first two are failures; the third is reported, because running one
+# project on a short clip is a legitimate thing to want.
+#
+# Sets VIDEO_FP -- "<md5>:<frames>:<bytes>" -- for the cross-project check.
+VIDEO_FP=""
 verify_video() {
   local rel="$1"
-  local missing
-  missing=$(fleet fanout edge "test -f \$HOME/$rel && echo ok || echo MISSING" 90 2>&1 | grep -c MISSING)
+  local out
+  # `$f` is deliberately unquoted on the remote side. The command crosses four
+  # parsers -- local bash, python's argv, ssh, remote bash -- and an inner
+  # `\\\"` survived none of them intact: md5sum and stat were handed a mangled
+  # argument and returned nothing, so the fingerprint came back as ":905:".
+  # These paths are fleet-fixed and contain no spaces, so the quotes bought
+  # nothing and cost the fields they were meant to protect.
+  out=$(fleet fanout edge "
+f=\$HOME/$rel
+if [ -f \$f ]; then
+  fr=\$(python3 -c \"
+import cv2
+c=cv2.VideoCapture('\$f')
+print(int(c.get(cv2.CAP_PROP_FRAME_COUNT)), end='')
+\" 2>/dev/null || echo '?')
+  echo FP=\$(md5sum \$f | cut -c1-10):\${fr}:\$(stat -c%s \$f)
+else
+  echo FP=MISSING
+fi" 120 2>&1)
+
+  local fps_seen missing uniq
+  fps_seen=$(echo "$out" | sed -n 's/^ *FP=//p')
+  missing=$(echo "$fps_seen" | grep -c MISSING)
   if [ "$missing" -gt 0 ]; then
-    echo "::fail:: $missing edge(s) are missing $rel"
+    echo "::fail:: $missing of 9 edge(s) are missing $rel"
     return 1
   fi
-  say "   video present on all 9 edges: $rel"
+
+  uniq=$(echo "$fps_seen" | sort -u | wc -l)
+  if [ "$uniq" -ne 1 ]; then
+    # Not a warning: the edges are meant to be running one identical workload.
+    echo "::fail:: the 9 edges disagree on $rel — $(echo "$fps_seen" | sort -u | tr '\n' ' ')"
+    return 1
+  fi
+
+  VIDEO_FP=$(echo "$fps_seen" | head -1)
+  local md5="${VIDEO_FP%%:*}" rest="${VIDEO_FP#*:}"
+  local frames="${rest%%:*}" bytes="${rest#*:}"
+  say "   video identical on all 9 edges: $rel"
+  say "     ${bytes} B · ${frames} frames · md5 ${md5}"
+  progress "frames=${frames} video_bytes=${bytes} video_md5=${md5}"
   return 0
 }
 
@@ -243,7 +293,7 @@ validate() {
 }
 
 # ==================================================================== driver
-say "::note:: fleet schedule starting — split → PA → dmsf, one short video (905 frames)"
+say "::note:: fleet schedule starting — split → PA → dmsf"
 say "workstation → dai (${FLEET_DAI_HOST:-100.68.127.89}) → 9 edge + 3 cloud"
 
 if ! fleet check >/dev/null 2>&1; then
@@ -255,6 +305,8 @@ say "preflight ok: dai, machine-2, device-1 all answered"
 
 failed=0
 total=0
+#: "<project>=<md5>:<frames>:<bytes>" per project, compared at the end.
+VIDEO_SEEN=""
 for proj in split PA dmsf; do
   if [ -n "$ONLY" ] && [ "$ONLY" != "$proj" ]; then continue; fi
   total=$((total + 1))
@@ -268,7 +320,27 @@ for proj in split PA dmsf; do
   echo "::step-done:: $proj rc=$rc"
   say "   $proj finished in $((SECONDS - start))s (rc=$rc)"
   [ "$rc" -ne 0 ] && failed=$((failed + 1))
+  [ -n "$VIDEO_FP" ] && VIDEO_SEEN="$VIDEO_SEEN $proj=$VIDEO_FP"
 done
+
+# Comparing the three is the reason they run back to back. If they did not read
+# the same input, each result is still valid on its own but the comparison is
+# not -- and that is invisible in the numbers, so it has to be said out loud.
+if [ -n "$VIDEO_SEEN" ]; then
+  distinct=$(echo "$VIDEO_SEEN" | tr ' ' '\n' | sed '/^$/d' | cut -d= -f2 | sort -u | wc -l)
+  if [ "$distinct" -gt 1 ]; then
+    say ""
+    say "!! the projects did NOT run the same video:"
+    for e in $VIDEO_SEEN; do
+      n="${e%%=*}"; v="${e#*=}"; f="${v#*:}"
+      say "     ${n}: ${f%%:*} frames  (md5 ${v%%:*})"
+    done
+    say "   each result is valid on its own; comparing them across projects is not."
+    note "⚠️ projects ran different videos — results are not comparable across them"
+  else
+    say "all projects read the same video ($(echo "$VIDEO_SEEN" | tr ' ' '\n' | sed '/^$/d' | head -1 | cut -d= -f2 | cut -d: -f2) frames)"
+  fi
+fi
 
 [ "$DRY_RUN" = "1" ] || kill_fleet
 say "::note:: schedule done — $((total - failed))/${total} projects ok"
