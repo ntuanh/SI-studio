@@ -19,7 +19,8 @@ from .config import settings
 from .db import dispose_db, init_db
 from .inference.broker import broker
 from .inference.orchestrator import orchestrator
-from .routers import clusters, control, devices, metrics, reports, run, server, web
+from .routers import autorun, clusters, control, devices, metrics, reports, run, server, web
+from .services.autorun import runner as autorunner
 from .services.metrics_bus import bus
 from .ssh import gateway
 from .ssh.pool import pool
@@ -64,6 +65,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("shutting down: stopping runs, closing SSH + broker")
         from .db import SessionFactory
 
+        # Before the fleet teardown: an auto-run schedule is what *drives* the
+        # runs below, so letting it keep launching work into a closing service
+        # would race the shutdown it is racing anyway.
+        try:
+            await autorunner.aclose()
+        except Exception:
+            log.exception("failed to stop the auto-run schedule cleanly")
+
         try:
             async with SessionFactory() as session:
                 await orchestrator.stop_all(session)
@@ -99,6 +108,7 @@ app.include_router(clusters.router)
 app.include_router(run.router)
 app.include_router(metrics.router)
 app.include_router(reports.router)
+app.include_router(autorun.router)
 
 
 # ------------------------------------------------------------------------ docs
@@ -226,6 +236,9 @@ async def health() -> dict[str, Any]:
         "ssh_sessions": sum(1 for s in pool.statuses().values() if s == "on"),
         "active_runs": len(orchestrator.active_runs()),
         "ws_subscribers": bus.subscriber_count,
+        # Cheap enough to include, and it makes an unattended schedule visible
+        # to whatever is already polling /health.
+        "autorun": (autorunner.status()["active"] or {}).get("id", ""),
     }
 
 

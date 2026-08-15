@@ -244,6 +244,27 @@
     sshStatus: function () { return request('GET', '/control/status'); },
     allowedCommands: function () { return request('GET', '/control/allowed-commands'); },
 
+    // --- auto-run: unattended schedule scripts ---------------------------
+    /* Unlike everything above, these do not fan out over SSH: the schedule
+     * runs as a local subprocess on the machine hosting the API, and reports
+     * progress over the same /ws/stream this client already listens to. */
+    autorunStatus: function () { return request('GET', '/autorun/status'); },
+    autorunScripts: function () { return request('GET', '/autorun/scripts'); },
+    autorunStart: function (script, opts) {
+      var body = { script: script };
+      if (opts && opts.args) body.args = opts.args;
+      if (opts && opts.cwd) body.cwd = opts.cwd;
+      if (opts && opts.markers) body.markers = opts.markers;
+      if (opts && opts.notify != null) body.notify = !!opts.notify;
+      if (opts && opts.notifySteps != null) body.notify_steps = !!opts.notifySteps;
+      if (opts && opts.env) body.env = opts.env;
+      return request('POST', '/autorun/start', body);
+    },
+    autorunStop: function () { return request('POST', '/autorun/stop', {}); },
+    autorunTail: function (limit) { return request('GET', '/autorun/tail?limit=' + (limit || 200)); },
+    autorunHistory: function (limit) { return request('GET', '/autorun/history?limit=' + (limit || 20)); },
+    autorunNotifyTest: function () { return request('POST', '/autorun/notify/test'); },
+
     // --- broker / server card -------------------------------------------
     /* `form` is the card's own shape: {ip, port, api_port, user, password}.
      * The password is write-only -- getServerConfig() returns has_credentials. */

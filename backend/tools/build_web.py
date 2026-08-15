@@ -894,8 +894,97 @@ VISUAL_SECTION = """
         </sc-if>
 """.replace("__INPUT__", _VIZ_INPUT).replace("__CAPTION__", _VIZ_CAPTION)
 
+# ------------------------------------------------------------------ patch 3/3
+#: The Progress section: start the fleet schedule and watch it.
+#:
+#: A section of its own rather than a card on Control, because the two answer
+#: different questions. Control is "run this command on those machines, show me
+#: the output" -- a console, read line by line while you sit there. A schedule
+#: is the opposite: hours long, unattended, and the only things worth seeing are
+#: which project is up, how far in it is, and whether anything broke. That reads
+#: as a status board, and a status board does not fit in a console.
+#:
+#: Every value here is filled by `live-patch.js` from /autorun/status plus the
+#: `autorun_*` frames on /ws/stream, so the page is correct on load and stays
+#: correct without polling.
+PROGRESS_SECTION = """
+        <!-- ============ PROGRESS ============ -->
+        <sc-if value="{{ showProgress }}" hint-placeholder-val="{{ false }}">
+          <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:16px; margin-bottom:16px; flex-wrap:wrap;">
+            <div>
+              <h1 style="margin:0; font-size:20px; font-weight:800;">Progress</h1>
+              <p style="margin:4px 0 0; font-size:13px; color:var(--muted); max-width:640px;">Run a schedule script on the fleet, unattended. Projects run one after another; each one's batch counter and FPS are read out of the server log as it goes, and failures reach Telegram the moment they happen.</p>
+            </div>
+            <div style="{{ prog.headlineStyle }}">
+              <div style="font-size:13px; font-weight:700; color:var(--ink);">{{ prog.headline }}</div>
+              <div style="font-size:10px; color:var(--muted);">{{ prog.headlineSub }}</div>
+            </div>
+          </div>
+
+          <div class="prog-col">
+            <!-- launch row -->
+            <div class="prog-card" style="display:flex; gap:9px; align-items:center; flex-wrap:wrap;">
+              <span style="__CAPTION__">Schedule</span>
+              <select value="{{ prog.script }}" sc-camel-on-change="{{ prog.onScript }}" style="__INPUT__ flex:1; min-width:220px;">
+                <sc-for list="{{ prog.scripts }}" as="s" hint-placeholder-count="2">
+                  <option value="{{ s.name }}" selected="{{ s.selected }}">{{ s.name }}</option>
+                </sc-for>
+              </select>
+              <button sc-camel-on-click="{{ prog.onRun }}" disabled="{{ prog.runDisabled }}" style="{{ prog.runStyle }}">{{ prog.runLabel }}</button>
+              <button sc-camel-on-click="{{ prog.onStop }}" disabled="{{ prog.stopDisabled }}" style="{{ prog.stopStyle }}">&#9632; Stop</button>
+              <span style="flex:1;"></span>
+              <span title="{{ prog.notifyTitle }}" style="{{ prog.notifyStyle }}">{{ prog.notifyLabel }}</span>
+            </div>
+
+            <!-- per-project board: one row per step, live counters on the open one -->
+            <div class="prog-card" style="{{ prog.boardStyle }}">
+              <sc-for list="{{ prog.steps }}" as="p" hint-placeholder-count="3">
+                <div style="{{ p.rowStyle }}">
+                  <span style="{{ p.dotStyle }}"></span>
+                  <span style="flex:1; min-width:0; font-size:13px; font-weight:700; color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{{ p.name }}</span>
+                  <span style="{{ p.metricStyle }}" class="num">{{ p.metrics }}</span>
+                  <span style="font-size:11px; color:var(--muted); min-width:58px; text-align:right;" class="num">{{ p.duration }}</span>
+                  <span style="{{ p.badgeStyle }}">{{ p.badge }}</span>
+                </div>
+                <div style="{{ p.barTrackStyle }}"><div style="{{ p.barFillStyle }}"></div></div>
+              </sc-for>
+              <div style="{{ prog.emptyStyle }}">Nothing has run yet. Pick a schedule and press Run &mdash; it keeps going after you close this tab.</div>
+            </div>
+
+            <!-- transcript -->
+            <div class="prog-card" style="background:#0b1020; border-color:#1e293b;">
+              <div style="display:flex; align-items:center; gap:8px; margin-bottom:9px;">
+                <span style="font-size:11px; color:#94A3B8; font-family:ui-monospace,monospace;">{{ prog.logTitle }}</span>
+                <span style="flex:1;"></span>
+                <button sc-camel-on-click="{{ prog.onClear }}" style="background:none; border:none; color:#64748b; font-size:11px; cursor:pointer;">clear</button>
+              </div>
+              <div id="si-prog-log" style="max-height:330px; overflow:auto; display:flex; flex-direction:column; gap:2px; font-family:ui-monospace,monospace; font-size:12px; line-height:1.55;">
+                <sc-for list="{{ prog.log }}" as="l" hint-placeholder-count="4">
+                  <div style="color:{{ l.color }}; white-space:pre-wrap;">{{ l.text }}</div>
+                </sc-for>
+              </div>
+            </div>
+          </div>
+        </sc-if>
+""".replace("__INPUT__", _VIZ_INPUT).replace("__CAPTION__", _VIZ_CAPTION)
+
+PROGRESS_CSS = """
+  /* ---- Progress tab ---- */
+  .prog-col { display:flex; flex-direction:column; gap:12px; }
+  .prog-card {
+    background:var(--raised); border:1px solid var(--border);
+    border-radius:14px; padding:14px;
+  }
+  /* The bar is the only moving thing on the page, so it gets a transition --
+     a batch counter that jumps looks like a glitch, one that slides reads as
+     the run advancing. Width only; nothing here animates layout. */
+  .prog-bar-fill { transition:width .45s ease; }
+  @media (prefers-reduced-motion: reduce) { .prog-bar-fill { transition:none; } }
+"""
+
 #: Closes the `showMain` wrapper, i.e. the end of the last section. The Visual
-#: section goes in ahead of it, so it sits after Control like its nav item does.
+#: and Progress sections go in ahead of it, so they sit after Control like
+#: their nav items do.
 SECTIONS_CLOSE = "\n      </sc-if>\n    </main>"
 
 
@@ -1247,15 +1336,17 @@ def _patch_template(
             "stylesheet anchor is missing or ambiguous -- the UI's <style> block "
             "changed; update CSS_ANCHOR"
         )
-    html = html.replace(CSS_ANCHOR, CSS_ANCHOR + "\n" + VISUAL_CSS, 1)
+    html = html.replace(CSS_ANCHOR, CSS_ANCHOR + "\n" + VISUAL_CSS + PROGRESS_CSS, 1)
 
-    # --- the Visual section, last of the tabs ---
+    # --- the Visual and Progress sections, last of the tabs ---
     if html.count(SECTIONS_CLOSE) != 1:
         raise BuildError(
             "sections anchor is missing or ambiguous -- the UI's tab wrapper "
             "changed; update SECTIONS_CLOSE"
         )
-    html = html.replace(SECTIONS_CLOSE, VISUAL_SECTION + SECTIONS_CLOSE, 1)
+    html = html.replace(
+        SECTIONS_CLOSE, VISUAL_SECTION + PROGRESS_SECTION + SECTIONS_CLOSE, 1
+    )
 
     # --- live bridge, appended inside the logic script ---
     start = html.find(SCRIPT_OPEN)

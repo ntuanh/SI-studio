@@ -987,10 +987,21 @@
           // `id` is "" for meta lines that belong to the run as a whole
           // (`$ cmd → N host(s)`), which have no single owner.
           self.sshLog([{ text: text, color: lineColor(text, stream) }], id);
+          // A schedule's output is a meta line too, so mirror it into the
+          // Progress transcript while one is running. Both tabs want it: the
+          // console because that is where output goes, Progress because that
+          // is where someone watching the schedule is actually looking.
+          var run = (self.state.prog || {}).run;
+          if (!id && run && run.running) {
+            self.progLog(text, lineColor(text, stream));
+          }
         },
         onMetrics: function (payload) { self.siApplyMetrics(payload); },
         onEvent: function (frame) {
           if (!frame || !frame.name) return;
+          // Auto-run frames drive the Progress board and are far too frequent
+          // to also narrate into the console.
+          if (self.progOnEvent(frame)) return;
           self.sshLog([{ text: '· ' + frame.name +
             (frame.cluster ? ' (cluster ' + frame.cluster + ')' : ''), color: C.hint }]);
         }
@@ -1999,6 +2010,311 @@
       this.setState(function (s) {
         return { viz: Object.assign({}, s.viz || {}, patch) };
       });
+    },
+
+    /* ==================================================================
+     * Progress — the unattended fleet schedule.
+     *
+     * State lives under `state.prog` and is fed from two places: one
+     * /autorun/status call on entering the tab, and the `autorun_*` frames
+     * on the stream after that. The status call is what makes the tab
+     * correct when it is opened *during* a run that started hours ago --
+     * without it the board would be empty until the next frame arrived.
+     * ================================================================== */
+    progPatch: function (patch) {
+      this.setState(function (s) {
+        return { prog: Object.assign({}, s.prog || {}, patch) };
+      });
+    },
+
+    progLog: function (text, color) {
+      this.setState(function (s) {
+        var prog = s.prog || {};
+        // Bounded: a schedule runs for hours and the transcript is on disk
+        // anyway (autorun/runs/<id>/output.log) -- the tab only needs the
+        // recent past, and an unbounded array is how a long run ends up
+        // freezing the page it is reporting to.
+        var log = (prog.log || []).concat([{ text: text, color: color || C.out }]);
+        if (log.length > 400) log = log.slice(log.length - 400);
+        return { prog: Object.assign({}, prog, { log: log }) };
+      });
+    },
+
+    /* Load the script list and whatever is already running. Safe to call
+     * repeatedly; it is what the tab does on every entry. */
+    progLoad: function () {
+      var self = this;
+      return Promise.all([SI.api.autorunStatus(), SI.api.autorunScripts()])
+        .then(function (res) {
+          var status = res[0] || {};
+          var scripts = (res[1] || {}).scripts || [];
+          var cur = (self.state.prog || {}).script;
+          self.progPatch({
+            run: status.active || null,
+            notify: status.notify || {},
+            stallAfter: status.stall_after_s,
+            scripts: scripts,
+            // Prefer the running script, then whatever was picked, then the
+            // fleet schedule if it is there, then simply the first.
+            script: (status.active && status.active.script &&
+                     self.progShort(status.active.script)) || cur ||
+                    self.progDefaultScript(scripts),
+            loaded: true
+          });
+        })
+        .catch(function (e) {
+          self.progPatch({ loaded: true, error: errText(e) });
+        });
+    },
+
+    progShort: function (path) {
+      return String(path || '').replace(/\\/g, '/').split('/').pop();
+    },
+
+    progDefaultScript: function (scripts) {
+      var names = (scripts || []).map(function (s) { return s.name; });
+      var fleet = names.filter(function (n) { return /fleet.*\.sh$/i.test(n); })[0];
+      return fleet || names[0] || '';
+    },
+
+    progRun: function () {
+      var self = this;
+      var prog = this.state.prog || {};
+      var script = prog.script;
+      if (!script) { this.progLog('✗ pick a schedule first', C.err); return; }
+      if (!SI.isLive() && !SI.config.baseUrl) {
+        this.progLog('✗ no backend configured — click the header chip', C.err);
+        return;
+      }
+
+      this.progPatch({ busy: true, error: '' });
+      this.progLog('▶ starting ' + script, C.info);
+      return SI.api.autorunStart(script, { notify: true, notifySteps: true })
+        .then(function (body) {
+          self.progPatch({ run: body.run || null, busy: false });
+          var n = (body.notify || {});
+          if (!n.enabled) {
+            self.progLog('  (Telegram is off — set TELEGRAM_BOT_TOKEN to get alerts)', C.hint);
+          }
+          // The stream may not be open in Simulate mode; without it the board
+          // would never advance, and a silent board is worse than no board.
+          self.siOpenStream();
+        })
+        .catch(function (e) {
+          self.progPatch({ busy: false, error: errText(e) });
+          self.progLog('✗ ' + errText(e), C.err);
+        });
+    },
+
+    progStop: function () {
+      var self = this;
+      this.progLog('^C stopping the schedule', C.warn);
+      return SI.api.autorunStop()
+        .then(function (body) {
+          if (!body.stopped) self.progLog('  nothing was running', C.hint);
+          else self.progLog('  ' + (body.outcome || 'stopped'), C.warn);
+          return self.progLoad();
+        })
+        .catch(function (e) { self.progLog('✗ ' + errText(e), C.err); });
+    },
+
+    /* Stream frames. Kept in one place so the board's rules are readable:
+     * every frame either replaces the run object or edits one step of it. */
+    progOnEvent: function (frame) {
+      var name = frame && frame.name;
+      if (!name || name.indexOf('autorun') !== 0) return false;
+
+      if (name === 'autorun_started' || name === 'autorun_finished') {
+        this.progPatch({ run: frame.run || null });
+        if (name === 'autorun_finished') {
+          var r = frame.run || {};
+          var c = r.counts || {};
+          this.progLog('└─ ' + r.status + ' — ' + (c.ok || 0) + '/' + (c.total || 0) +
+            ' ok, exit ' + r.exit_code,
+            r.status === 'ok' ? C.ok : C.err);
+        }
+        return true;
+      }
+
+      if (name === 'autorun_step' && frame.step) {
+        this.progPatch({ run: this.progMergeStep(frame.step) });
+        return true;
+      }
+
+      if (name === 'autorun_progress') {
+        // High frequency (every poll of every project). It only ever touches
+        // the open step's counters, never the array's shape.
+        this.progPatch({
+          run: this.progMergeStep({
+            index: frame.step, name: frame.step_name,
+            progress: frame.progress || {}, progress_text: frame.text || ''
+          }, true)
+        });
+        return true;
+      }
+
+      if (name === 'autorun_note') {
+        this.progLog('ℹ ' + frame.text, C.info);
+        return true;
+      }
+
+      if (name === 'autorun_stalled') {
+        this.progLog('⏳ no output for ' + Math.round(frame.quiet_s) + 's — still running', C.warn);
+        return true;
+      }
+      return true;
+    },
+
+    /* Everything the Progress markup binds to. Pure: reads state, returns
+     * values, touches nothing. */
+    progRenderVals: function (st) {
+      var self = this;
+      var prog = st.prog || {};
+      var run = prog.run;
+      var running = !!(run && run.running);
+      var counts = (run && run.counts) || {};
+      var notify = prog.notify || {};
+
+      var btn = 'padding:8px 14px; border-radius:9px; border:1px solid var(--border);' +
+                'font-size:12px; font-weight:700; cursor:pointer;';
+
+      var R = {
+        script: prog.script || '',
+        scripts: (prog.scripts || []).map(function (s) {
+          return { name: s.name, selected: s.name === prog.script };
+        }),
+        onScript: function (e) {
+          var v = e && e.target ? e.target.value : e;
+          self.progPatch({ script: v });
+        },
+        onRun: function () { self.progRun(); },
+        onStop: function () { self.progStop(); },
+        onClear: function () { self.progPatch({ log: [] }); },
+
+        runLabel: running ? 'Running…' : (prog.busy ? 'Starting…' : '▶ Run schedule'),
+        runDisabled: running || !!prog.busy || !prog.script,
+        stopDisabled: !running,
+        runStyle: btn + (running || prog.busy
+          ? 'background:var(--bg); color:var(--muted); cursor:progress;'
+          : 'background:var(--alert); color:#fff; border-color:transparent;'),
+        stopStyle: btn + (running
+          ? 'background:var(--surface); color:var(--ink);'
+          : 'background:var(--bg); color:var(--muted); cursor:not-allowed;'),
+
+        // Say plainly whether an unattended run can actually reach you. This
+        // is the one piece of config whose absence is silent until it matters.
+        notifyLabel: notify.enabled ? '🔔 Telegram on' : '🔕 Telegram off',
+        notifyTitle: notify.enabled
+          ? 'Failures and the final summary go to chat ' + (notify.chat_id || '')
+          : 'Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in backend/.env',
+        notifyStyle: 'font-size:11px; font-weight:700; padding:5px 9px; border-radius:7px;' +
+          (notify.enabled
+            ? 'color:var(--edge); background:color-mix(in srgb, var(--edge) 12%, transparent);'
+            : 'color:var(--muted); background:var(--bg);'),
+
+        logTitle: run ? 'auto-run ' + run.id : 'auto-run transcript',
+        log: (prog.log || []).map(function (l) { return { text: l.text, color: l.color }; }),
+
+        boardStyle: (run && (run.steps || []).length)
+          ? 'display:flex; flex-direction:column; gap:7px;'
+          : 'display:flex; flex-direction:column; gap:7px;',
+        emptyStyle: (run && (run.steps || []).length)
+          ? 'display:none;'
+          : 'font-size:12px; color:var(--muted); padding:6px 2px;'
+      };
+
+      // --- headline ------------------------------------------------------
+      if (!run) {
+        R.headline = 'Idle';
+        R.headlineSub = (prog.scripts || []).length + ' schedule(s) available';
+      } else {
+        R.headline = running
+          ? (run.current_step || 'starting…')
+          : ({ ok: 'Finished', failed: 'Failed', stopped: 'Stopped' }[run.status] || run.status);
+        R.headlineSub = (counts.ok || 0) + '/' + (counts.total || 0) + ' ok · ' +
+          self.progDur(run.duration_s) + (run.stalled ? ' · quiet' : '');
+      }
+      R.headlineStyle = 'text-align:right; padding:7px 11px; border-radius:10px;' +
+        'border:1px solid var(--border); background:var(--raised);' +
+        (running ? 'box-shadow:inset 3px 0 0 var(--alert);' : '');
+
+      // --- one row per project -------------------------------------------
+      var DOT = { ok: 'var(--edge)', failed: 'var(--alert)', running: 'var(--data)',
+                  stopped: 'var(--muted)' };
+      R.steps = ((run && run.steps) || []).map(function (s) {
+        var p = s.progress || {};
+        var isRun = s.status === 'running';
+
+        // The metric strip is the answer to "how far in is it": batch index
+        // first because that is what moves, fps second because that is what
+        // the run is for.
+        var bits = [];
+        if (p.batch != null) bits.push('batch ' + p.batch);
+        if (p.fps != null && Number(p.fps) > 0) bits.push(Number(p.fps).toFixed(2) + ' fps');
+        if (p.reg) bits.push('reg ' + p.reg);
+        if (p.archive) bits.push(p.archive);
+        if (!bits.length && s.progress_text) bits.push(s.progress_text);
+
+        // A percentage only when the script actually said what the total is;
+        // inventing a denominator would make the bar a lie.
+        var pct = 0;
+        if (p.batch != null && p.total != null && Number(p.total) > 0) {
+          pct = Math.max(0, Math.min(100, (Number(p.batch) / Number(p.total)) * 100));
+        }
+
+        return {
+          name: s.name,
+          metrics: bits.join(' · '),
+          duration: self.progDur(s.duration_s),
+          badge: s.status === 'ok' ? '✔' : s.status === 'failed' ? 'rc ' + s.rc
+               : s.status === 'stopped' ? '■' : '',
+          rowStyle: 'display:flex; align-items:center; gap:9px; padding:7px 9px;' +
+            'border-radius:9px; background:' + (isRun ? 'var(--bg)' : 'transparent') + ';',
+          dotStyle: 'width:9px; height:9px; border-radius:50%; flex-shrink:0; background:' +
+            (DOT[s.status] || 'var(--muted)') + ';',
+          metricStyle: 'font-size:11px; color:var(--muted); font-family:ui-monospace,monospace;' +
+            'overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:280px;',
+          badgeStyle: 'font-size:11px; font-weight:700; min-width:34px; text-align:right; color:' +
+            (s.status === 'failed' ? 'var(--alert)' : s.status === 'ok' ? 'var(--edge)' : 'var(--muted)') + ';',
+          barTrackStyle: (isRun && pct > 0)
+            ? 'height:3px; border-radius:2px; background:var(--border); margin:0 9px 3px;'
+            : 'display:none;',
+          barFillStyle: 'height:3px; border-radius:2px; background:var(--data); width:' +
+            pct.toFixed(1) + '%;'
+        };
+      });
+      R.steps.forEach(function (s) { s.barFillClass = 'prog-bar-fill'; });
+      return R;
+    },
+
+    progDur: function (seconds) {
+      var s = Math.max(0, Math.round(seconds || 0));
+      if (s < 60) return s + 's';
+      if (s < 3600) return Math.floor(s / 60) + 'm ' + ('0' + (s % 60)).slice(-2) + 's';
+      return Math.floor(s / 3600) + 'h ' + ('0' + Math.floor((s % 3600) / 60)).slice(-2) + 'm';
+    },
+
+    /* Merge one step into the current run. `partial` means "counters only":
+     * a progress frame must not overwrite status/rc, which it does not carry. */
+    progMergeStep: function (step, partial) {
+      var run = (this.state.prog || {}).run;
+      if (!run || !step) return run;
+      var steps = (run.steps || []).slice();
+      var at = -1;
+      for (var i = 0; i < steps.length; i++) {
+        if (steps[i].index === step.index) { at = i; break; }
+      }
+      if (at < 0) {
+        if (partial) return run;   // counters for a step we have not seen yet
+        steps.push(step);
+      } else if (partial) {
+        steps[at] = Object.assign({}, steps[at], {
+          progress: step.progress, progress_text: step.progress_text
+        });
+      } else {
+        steps[at] = Object.assign({}, steps[at], step);
+      }
+      return Object.assign({}, run, { steps: steps });
     },
 
     /* Object URLs are owned by this component: without the revoke the blobs
@@ -3475,6 +3791,8 @@
        * renderVals built, so the rail cannot drift into two looks. */
       var navProto = ((R.navItems || [])[0] || {}).style || {};
       R.showVisual = st.active === 'visual';
+      R.showProgress = st.active === 'progress';
+      var progRun = (st.prog || {}).run;
       R.navItems = (R.navItems || []).concat([{
         key: 'visual',
         label: 'Visual',
@@ -3486,7 +3804,28 @@
           color: R.showVisual ? 'var(--ink)' : 'var(--muted)',
           boxShadow: R.showVisual ? 'inset 3px 0 0 var(--data)' : 'none'
         })
+      }, {
+        /* Progress, eighth and last. Alert-coloured because unlike every tab
+         * above it this one is about something happening *now* and possibly
+         * going wrong -- and its badge is a live dot for exactly that reason:
+         * a schedule running is the one state you want visible from whatever
+         * tab you happen to be on. */
+        key: 'progress',
+        label: 'Progress',
+        color: 'var(--alert)',
+        badge: progRun && progRun.running ? '●' : '',
+        onClick: function () {
+          self.setState({ active: 'progress', detailId: null });
+          self.progLoad();
+        },
+        style: Object.assign({}, navProto, {
+          background: R.showProgress ? 'var(--surface)' : 'transparent',
+          color: R.showProgress ? 'var(--ink)' : 'var(--muted)',
+          boxShadow: R.showProgress ? 'inset 3px 0 0 var(--alert)' : 'none'
+        })
       }]);
+
+      R.prog = this.progRenderVals(st);
 
       // --- one console per target, focused + rail ---
       var outBy = st.ssh.outBy || {};

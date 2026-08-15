@@ -523,3 +523,30 @@ class FleetMeasureOut(_Base):
     summary: dict[str, Any] = Field(default_factory=dict)
     applied: bool = False
     bandwidth_basis: str = "shared"
+
+
+# ------------------------------------------------------------------- auto-run
+class AutoRunStartRequest(_Base):
+    """Launch a schedule script (`services/autorun.py`)."""
+
+    #: Relative to `AUTORUN_DIR`, or absolute when `AUTORUN_ALLOW_ANY_PATH`.
+    script: str
+    args: list[str] = Field(default_factory=list)
+    #: Defaults to the script's own directory.
+    cwd: str | None = None
+    #: auto   — `::step::` markers, falling back to `=== banner ===` heuristics
+    #: strict — explicit markers only
+    #: off    — track the run as a whole, no per-step detail
+    markers: Literal["auto", "strict", "off"] = "auto"
+    #: Master switch for this run's Telegram messages.
+    notify: bool = True
+    #: Per-step "done" messages. Off keeps only start, failures and the summary
+    #: — the right setting for a schedule with dozens of short steps.
+    notify_steps: bool = True
+    #: Extra environment for the script.
+    env: dict[str, str] = Field(default_factory=dict)
+
+
+class AutoRunStopRequest(_Base):
+    #: Seconds to wait at each rung of SIGINT → SIGTERM → SIGKILL.
+    grace: float | None = None

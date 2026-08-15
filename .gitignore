@@ -11,3 +11,28 @@ venv/
 .env
 __pycache__/
 *.py[cod]
+
+# ---------------------------------------------------------------------------
+# Fleet credentials -- PLAINTEXT SSH PASSWORDS FOR 13 LAB MACHINES.
+# `origin` is a public repo, and every one of these files was untracked but
+# NOT ignored, so a single `git add .` would have published them. The runbooks
+# in run/guides/ each carry their own "do not commit this file" warning; this
+# is that warning enforced rather than trusted.
+#
+# The schedule scripts in backend/autorun/ are deliberately NOT covered here:
+# they read every credential from the environment (backend/.env) and contain
+# none, which is what makes them safe to commit.
+# ---------------------------------------------------------------------------
+controller/
+run/guides/
+hosts.txt
+
+# The runbooks tell you to save these drivers "in your scratchpad", with the
+# passwords inline -- so catch them wherever they land, not just where the
+# guides happen to put them.
+fleet.py
+cluster.py
+# ...except the one in autorun/, which is the same driver rewritten to read
+# every credential from the environment. It contains no password, and the
+# schedule cannot run without it, so it has to be committable.
+!backend/autorun/fleet.py

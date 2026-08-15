@@ -166,6 +166,13 @@ authorize by hand.
 | POST | `/run/stop` | stop agents, drain queues |
 | GET | `/run/active`, `/run/history` | run state |
 | GET | `/metrics/latest` | snapshot, one §6 payload per cluster |
+| POST | `/autorun/start` | run a schedule script here, unattended — see [Auto-run](#auto-run-unattended-schedules) |
+| POST | `/autorun/stop` | stop it, killing the whole process tree |
+| GET | `/autorun/status` | active run, per-step state, notification wiring |
+| GET | `/autorun/scripts` | schedule scripts available in `AUTORUN_DIR` |
+| GET | `/autorun/tail`, `/autorun/history` | live output; past runs, newest first |
+| GET | `/autorun/runs/{id}/log` | a past run's full transcript |
+| POST | `/autorun/notify/test` | verify Telegram before trusting it overnight |
 | GET | `/export` | inventory back in the UI's export shape (no credentials) |
 | WS | `/ws/stream` | `ssh_status`, `exec_line`, `metrics`, `event` frames |
 | GET | `/`, `/runtime-config.js`, `/{asset}` | the website (no token; see above) |
@@ -616,6 +623,146 @@ Simulate is what computes *from* these numbers.
 
 ---
 
+## Auto-run: unattended schedules
+
+You have a bash script that runs a dozen projects back to back for eight hours.
+What you want from a control plane is not a shell — it is *knowing*: which
+project is running, which one broke, and a message on your phone the moment it
+does, so a batch that died at 02:10 is not discovered at 09:00.
+
+`POST /autorun/start` runs one script **on this machine** — the server where the
+project directories live — and reports on it. It is deliberately not part of
+`/control/exec`: that fans commands out to *devices*, whereas a schedule driving
+many projects is the conductor, not one of the players.
+
+```bash
+curl -X POST localhost:8000/autorun/start \
+  -H "X-API-Token: $API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"script": "nightly.sh"}'
+```
+
+Scripts live in `AUTORUN_DIR` (default `backend/autorun/`, which has a working
+`example-schedule.sh` and its own README). Output streams to `/ws/stream` as
+`exec_line` frames, so the Control tab console shows it live.
+
+### How progress is known
+
+The script is opaque to us, so progress is read out of its stdout:
+
+| Marker | Meaning |
+|---|---|
+| `::step:: <name>` | a project started (closes the previous one as ok) |
+| `::step-done:: <name> rc=<n>` | it finished; `rc` decides ok vs failed |
+| `::progress:: batch=N fps=X` | live counters for the open step — **UI only** |
+| `::note:: <text>` | a milestone, **forwarded to Telegram** |
+| `::fail:: <text>` | fail the current step with a reason |
+
+`echo "::step:: DAG"` is the whole integration. A `[3/12]` prefix on a step name
+also sets the expected total.
+
+`::progress::` exists separately from `::note::` because they answer to
+different audiences. A run polling its FPS every 20 s for half an hour would
+send ~80 Telegram messages and teach you to ignore the channel, so progress
+goes to the Progress tab and nowhere else. Anything shaped `k=v` becomes a
+field; `batch`, `total`, `fps`, `reg` and `archive` are rendered specially, and
+a `total` is what earns a row its progress bar — without one there is no honest
+denominator. The counters are deliberately **not** persisted per tick: they
+arrive for hours and would otherwise be the only disk activity a long run has.
+
+**With no markers you still get** the run's start, exit code, duration, stall
+warnings and a full transcript — the run-level verdict is the process's exit
+status, so it never depends on the script cooperating. Auto-run additionally
+reads common banner shapes (`=== name ===`, `--- name`, `### name`,
+`[3/12] name`) so an existing script gets per-project tracking with no edits.
+Those heuristics turn off **permanently** the first time a real `::step::`
+marker appears: a script printing both should be read the way its author meant,
+not counted twice. `"markers": "strict"` uses explicit markers only; `"off"`
+tracks the run as a whole.
+
+### Notifications
+
+Telegram, configured by `TELEGRAM_BOT_TOKEN` (from @BotFather) and
+`TELEGRAM_CHAT_ID`. Verify the wiring with `POST /autorun/notify/test` **before**
+an overnight run depends on it — it reports Telegram's own error text ("chat not
+found", "Unauthorized") rather than a bare failure.
+
+You get a message on start, on each step (silent, so only outcomes buzz — turn
+off with `"notify_steps": false`), on any step failure, on a stall, and a final
+summary with the per-step table. Failure alerts carry the last dozen lines of
+real output, with marker lines filtered out so the traceback is not buried under
+bookkeeping. The final summary of a failed run names the failed steps rather
+than quoting the transcript's tail — after a mid-schedule failure that tail is
+whatever succeeded *afterwards*, which points at the wrong project.
+
+`services/notify.py` swallows every transport failure and returns a bool. A
+lab with no internet, a wrong chat id or an expired token degrades to "no
+messages", never to a crashed run — which would be the worst possible failure
+mode for a feature whose whole job is telling you a run crashed. The bot token
+is scrubbed from every log line and error string, and no endpoint returns it.
+
+### Lifecycle
+
+- **One schedule at a time** — a second start gets 409. These scripts drive the
+  whole fleet; two would contend for the same GPUs and broker queues.
+- **The child runs in its own process group**, so `POST /autorun/stop` kills the
+  tree. Without it, signalling `bash` would leave the `python server.py` it
+  launched holding a GPU while the schedule looked stopped. Stopping escalates
+  SIGINT → SIGTERM → SIGKILL (`AUTORUN_STOP_GRACE` per rung), matching
+  `JobRegistry.interrupt`, so a project that writes result logs on the way out
+  gets the chance to.
+- **Going quiet is reported, never punished.** After `AUTORUN_STALL_SECONDS`
+  (default 900) with no output you get a "still running, not stopped" message.
+  Training steps are legitimately silent; killing one would destroy the run this
+  feature exists to protect.
+- **State is a folder, not a DB row** — `autorun/runs/<id>/manifest.json` plus
+  `output.log`, the same story as reports. History survives a restart and reads
+  in a text editor; deleting the folder deletes the run.
+
+### The Progress tab
+
+The eighth rail item, and the front end of all of the above: pick a schedule,
+press **▶ Run**, and watch a per-project board — one row each, a live dot, the
+batch counter and FPS as they move, a bar when the script said what the total
+is, and a verdict when it lands. The transcript streams underneath. It is a
+board rather than a console because a schedule is hours long and unattended,
+where the only questions are which project is up, how far in, and whether
+anything broke; Control's console answers a different question and is still
+there for it.
+
+Opening the tab calls `/autorun/status` before subscribing, so a run started
+hours ago renders correctly rather than staying blank until the next frame.
+The rail badge shows a dot whenever a schedule is running, from any tab.
+
+### The fleet schedule
+
+`autorun/fleet-3project.sh` is the real one: split → PA → dmsf across the
+13-host lab fleet, combining `run/guides/{split,PA,dmsf}.md`, all three on the
+same short video. `autorun/fleet.py` is its SSH driver (dai direct, LAN hosts
+as `direct-tcpip` channels through dai, since that subnet is not routed from
+the workstation). `DRY_RUN=1` checks every host, project directory and video
+without launching anything — worth running before committing the fleet to half
+an hour. See `autorun/README.md`.
+
+### Security
+
+This endpoint executes a shell script with the service's own privileges, so
+*which file runs* is the entire boundary: paths are resolved and must land
+inside `AUTORUN_DIR`, which catches `../` and symlinks pointing out of it.
+
+A schedule inherits only the `.env` keys matching `AUTORUN_ENV_PREFIXES`
+(default `FLEET_`). This exists because `pydantic-settings` parses `.env` into
+the `Settings` object and never into the environment, so a script would
+otherwise get none of its own config — but it is an allow-list rather than the
+whole file because `API_TOKEN` and `TELEGRAM_BOT_TOKEN` have no business in an
+operator script's environment, where a stray `env` or `set -x` would print them
+into a transcript this service stores and forwards to chat.
+There is no command allow-list, because unlike `/control/exec` the input is a
+file you wrote and put on the server, not a string typed into a web form.
+`AUTORUN_ALLOW_ANY_PATH=true` lifts the sandbox — only for a box where every
+API-token holder is already trusted with a shell on it.
+
+---
+
 ## Parity with the UI simulator
 
 `app/inference/simulation.py` is a line-for-line port of the UI's math, verified
@@ -772,7 +919,7 @@ one directory up.
 ## Tests
 
 ```bash
-pip install pytest httpx numpy quickjs
+pip install pytest pytest-asyncio httpx numpy quickjs
 pytest -q                                  # hermetic; no broker, no network
 pytest tests/test_broker_integration.py    # +7, needs RabbitMQ (else skipped)
 ```
@@ -788,9 +935,16 @@ auth and framing, the codec's round trip at 2/4/6/8/12/16 bits, spec measurement
 (that solo bandwidth readings never overlap while the contention pass does, and
 that the on-device benchmark's arithmetic is right — checked against a stub torch
 whose ops take a known time, since no CI box has a GPU), live metric
-aggregation through a real broker, and the website: that the build applies both
+aggregation through a real broker, the website (that the build applies both
 patches, rewrites every asset, refuses to build when a patch anchor moves, and
-that the asset route neither shadows the API nor serves anything outside `web/`.
+that the asset route neither shadows the API nor serves anything outside `web/`),
+and auto-run: the script sandbox against `../` and out-of-tree symlinks, marker
+and banner parsing, that an explicit marker disables the heuristics for good,
+that the exit code decides the verdict with no markers at all, that stopping
+kills a *grandchild* process and not just `bash`, and that the bot token reaches
+neither an error string nor a status response. The auto-run tests that need a
+real shell skip when `bash` is absent, so the suite still passes on a Windows box
+without Git Bash.
 
 The suite is order-independent: each test gets a fresh database.
 
@@ -813,3 +967,8 @@ See `.env.example` for the annotated list. The ones that matter most:
 | `MAX_MESSAGE_MB` | mirrors the UI's `maxMessageMb` prop (15) |
 | `ALLOW_UNSAFE_COMMANDS` | disables the exec guard |
 | `METRICS_WINDOW`, `METRICS_BROADCAST_HZ` | smoothing and push rate |
+| `AUTORUN_DIR` | schedule scripts, and the sandbox `/autorun/start` cannot escape |
+| `AUTORUN_ALLOW_ANY_PATH` | lifts that sandbox — trusted single-operator boxes only |
+| `AUTORUN_STALL_SECONDS` | quiet period before a run is *reported* stuck (never killed) |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | where auto-run sends progress and failures |
+| `NOTIFY_ENABLED` | master switch; inert anyway without the two above |

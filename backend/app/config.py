@@ -82,6 +82,48 @@ class Settings(BaseSettings):
     metrics_window: int = 60
     metrics_broadcast_hz: float = 2.0
 
+    # --- auto-run (services/autorun.py) ---
+    #: Where schedule scripts live, and the sandbox `/autorun/start` refuses to
+    #: escape. This endpoint executes a shell script with this service's
+    #: privileges, so *which file* is the only thing worth constraining.
+    autorun_dir: str = "./autorun"
+    #: Lift the sandbox and allow an absolute path anywhere on the box. Only for
+    #: a machine where every API-token holder is already trusted with a shell.
+    autorun_allow_any_path: bool = False
+    #: Quiet period after which a run is *reported* as possibly stuck. It is
+    #: never killed for going quiet -- a training step is legitimately silent
+    #: for a long time, and killing it would destroy the run it was reporting on.
+    autorun_stall_seconds: float = 900.0
+    #: Per signal in the SIGINT -> SIGTERM -> SIGKILL ladder, so a schedule that
+    #: writes its result logs on the way out gets the chance to.
+    autorun_stop_grace: float = 15.0
+    #: Cap on a single run's captured transcript; a runaway loop should not fill
+    #: the disk. Output keeps streaming to the UI after the cap.
+    autorun_log_max_mb: float = 64.0
+    #: Which `.env` keys a schedule script inherits, by prefix (comma-separated).
+    #: `pydantic-settings` parses .env into *this object*, never into the
+    #: environment, so without this a script gets none of it -- which is how the
+    #: fleet driver ended up with no credentials the first time.
+    #:
+    #: An allow-list rather than the whole file on purpose: `API_TOKEN` and
+    #: `TELEGRAM_BOT_TOKEN` have no business in an operator script's
+    #: environment, where a stray `env`, `set -x` or crash dump would print
+    #: them straight into a transcript this service then stores and forwards.
+    autorun_env_prefixes: str = "FLEET_"
+
+    # --- notifications (services/notify.py) ---
+    #: Master switch. Everything below is inert without a token and chat id, so
+    #: the feature is simply absent until configured.
+    notify_enabled: bool = True
+    #: From @BotFather. A credential -- keep it in .env, never in git.
+    telegram_bot_token: str = ""
+    #: Target chat. Message @userinfobot, or read `chat.id` from
+    #: api.telegram.org/bot<token>/getUpdates after messaging your bot once.
+    telegram_chat_id: str = ""
+    notify_timeout: float = 10.0
+    #: Forward `::note::` lines from the script as messages.
+    notify_notes: bool = True
+
     # ------------------------------------------------------------------
     @property
     def cors_origin_list(self) -> list[str]:
@@ -103,6 +145,10 @@ class Settings(BaseSettings):
         return self._abs(self.reports_dir)
 
     @property
+    def autorun_path(self) -> Path:
+        return self._abs(self.autorun_dir)
+
+    @property
     def agent_broker_url(self) -> str:
         """Broker URL handed to the agents running on the devices."""
         return self.device_broker_url.strip() or self.broker_url
@@ -118,6 +164,7 @@ def get_settings() -> Settings:
     s.secrets_path.mkdir(parents=True, exist_ok=True)
     s.shards_path.mkdir(parents=True, exist_ok=True)
     s.reports_path.mkdir(parents=True, exist_ok=True)
+    s.autorun_path.mkdir(parents=True, exist_ok=True)
     return s
 
 

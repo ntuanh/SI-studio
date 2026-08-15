@@ -21,6 +21,12 @@ os.environ.update(
     SECRETS_DIR=str(_TMP / "secrets"),
     SHARDS_DIR=str(_TMP / "shards"),
     REPORTS_DIR=str(_TMP / "reports"),
+    AUTORUN_DIR=str(_TMP / "autorun"),
+    # No test may ever reach out to Telegram. Tests that exercise notification
+    # content flip this back on with a stubbed transport.
+    NOTIFY_ENABLED="false",
+    TELEGRAM_BOT_TOKEN="",
+    TELEGRAM_CHAT_ID="",
     CORS_ORIGINS="*",
     MAX_MESSAGE_MB="15",
     ALLOW_UNSAFE_COMMANDS="false",
