@@ -237,8 +237,13 @@ async def health() -> dict[str, Any]:
         "active_runs": len(orchestrator.active_runs()),
         "ws_subscribers": bus.subscriber_count,
         # Cheap enough to include, and it makes an unattended schedule visible
-        # to whatever is already polling /health.
-        "autorun": (autorunner.status()["active"] or {}).get("id", ""),
+        # to whatever is already polling /health. Empty unless one is actually
+        # running: `active` holds the *last* run so the UI can render a
+        # finished board, and reporting that id here read as "a run is in
+        # progress" hours after it ended.
+        "autorun": (autorunner.status()["active"] or {}).get("id", "")
+        if autorunner.status()["running"]
+        else "",
     }
 
 

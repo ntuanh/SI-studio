@@ -664,6 +664,13 @@ def test_summary_message_lists_every_step(runner):
 
 
 # ------------------------------------------------------------------- endpoints
+def test_health_names_a_schedule_only_while_it_runs(client, auth):
+    """`active` deliberately holds the last run so the board still renders
+    after it ends -- but /health saying so reads as "a run is in progress"
+    hours later, to whatever is polling it."""
+    assert client.get("/health").json()["autorun"] == ""
+
+
 def test_status_endpoint_reports_idle(client, auth):
     body = client.get("/autorun/status", headers=auth).json()
     assert body["running"] is False and body["active"] is None
