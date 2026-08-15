@@ -232,8 +232,15 @@ def script(alias: str, path: str, timeout: int = 600) -> tuple[int, str]:
         stdin, out, err = c.exec_command("bash -s", timeout=timeout, get_pty=False)
         stdin.write(body)
         stdin.channel.shutdown_write()
-        text = out.read().decode("utf-8", "replace")
-        errtext = err.read().decode("utf-8", "replace")
+        try:
+            text = out.read().decode("utf-8", "replace")
+            errtext = err.read().decode("utf-8", "replace")
+        except EOFError:
+            # A script that restarts a service on this host can tear the
+            # channel down before its own `exit 0` is readable. That is the
+            # deploy path working, not failing, so report what did arrive
+            # rather than losing the whole transcript to an empty EOFError.
+            return -1, "(channel closed early -- verify separately)"
         return out.channel.recv_exit_status(), (text + errtext).rstrip()
     finally:
         c.close()
@@ -303,7 +310,12 @@ def main(argv: list[str]) -> int:
         print(f"unknown host {argv[2]!r}; known: dai, machine-1..10, device-1..3")
         return 2
     except Exception as exc:  # noqa: BLE001 - one clear line beats a traceback
-        print(f"fleet.py {verb} failed: {exc}")
+        # The type matters as much as the message: paramiko raises a bare
+        # `EOFError` when a channel closes early, and `str(EOFError())` is the
+        # empty string -- which reported a restart that had actually worked as
+        # "failed: " with nothing after it.
+        detail = str(exc) or "no detail"
+        print(f"fleet.py {verb} failed: {type(exc).__name__}: {detail}")
         return 1
     print(f"unknown verb {verb!r}")
     return 2
