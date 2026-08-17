@@ -913,7 +913,7 @@ PROGRESS_SECTION = """
           <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:16px; margin-bottom:16px; flex-wrap:wrap;">
             <div>
               <h1 style="margin:0; font-size:20px; font-weight:800;">Progress</h1>
-              <p style="margin:4px 0 0; font-size:13px; color:var(--muted); max-width:640px;">Run a schedule script on the fleet, unattended. Projects run one after another; each one's batch counter and FPS are read out of the server log as it goes, and failures reach Telegram the moment they happen.</p>
+              <p style="margin:4px 0 0; font-size:13px; color:var(--muted); max-width:640px;">Every project, one button. Each one gets the server started and then every stage launched, in its own directory, over the same SSH sessions the Control tab uses &mdash; then the queue waits for the server to exit before starting the next. Batch counter and FPS are read out of the server's own output as it goes, and failures reach Telegram the moment they happen.</p>
             </div>
             <div style="{{ prog.headlineStyle }}">
               <div style="font-size:13px; font-weight:700; color:var(--ink);">{{ prog.headline }}</div>
@@ -922,33 +922,78 @@ PROGRESS_SECTION = """
           </div>
 
           <div class="prog-col">
-            <!-- launch row -->
-            <div class="prog-card" style="display:flex; gap:9px; align-items:center; flex-wrap:wrap;">
-              <span style="__CAPTION__">Schedule</span>
-              <select value="{{ prog.script }}" sc-camel-on-change="{{ prog.onScript }}" style="__INPUT__ flex:1; min-width:220px;">
-                <sc-for list="{{ prog.scripts }}" as="s" hint-placeholder-count="2">
-                  <option value="{{ s.name }}" selected="{{ s.selected }}">{{ s.name }}</option>
+            <!-- launch row: the one button, then the editor that feeds it -->
+            <div class="prog-card" style="display:flex; flex-direction:column; gap:10px;">
+              <div style="display:flex; gap:9px; align-items:center; flex-wrap:wrap;">
+                <button sc-camel-on-click="{{ prog.onRunAll }}" disabled="{{ prog.runAllDisabled }}" title="{{ prog.runAllTitle }}" style="{{ prog.runAllStyle }}">{{ prog.runAllLabel }}</button>
+                <button sc-camel-on-click="{{ prog.onStop }}" disabled="{{ prog.stopDisabled }}" style="{{ prog.stopStyle }}">&#9632; Stop</button>
+                <button sc-camel-on-click="{{ prog.edit.onToggle }}" title="{{ prog.edit.toggleTitle }}" style="{{ prog.edit.toggleStyle }}">{{ prog.edit.toggleLabel }}</button>
+                <span style="flex:1;"></span>
+                <span title="{{ prog.notifyTitle }}" style="{{ prog.notifyStyle }}">{{ prog.notifyLabel }}</span>
+              </div>
+              <div style="{{ prog.errorStyle }}">{{ prog.errorText }}</div>
+
+              <!-- the project editor: the directories, in run order -->
+              <div style="{{ prog.edit.panelStyle }}">
+                <div style="{{ prog.edit.planStyle }}">
+                  <sc-for list="{{ prog.edit.plan }}" as="t" hint-placeholder-count="3">
+                    <div style="display:flex; gap:8px;"><span style="min-width:104px; font-weight:700; color:var(--ink);">{{ t.label }}</span><span class="num" style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{{ t.command }}</span><span>{{ t.hosts }}</span></div>
+                  </sc-for>
+                </div>
+                <sc-for list="{{ prog.edit.rows }}" as="e" hint-placeholder-count="3">
+                  <div style="{{ e.rowStyle }}">
+                    <span class="num" style="font-size:10px; color:var(--muted); min-width:14px;">{{ e.index }}</span>
+                    <div sc-camel-on-click="{{ e.onToggle }}" title="{{ e.checkTitle }}" style="{{ e.checkStyle }}">{{ e.check }}</div>
+                    <input value="{{ e.name }}" sc-camel-on-change="{{ e.onName }}" placeholder="name" style="__INPUT__ width:130px;">
+                    <input value="{{ e.path }}" sc-camel-on-change="{{ e.onPath }}" placeholder="directory, e.g. ntuanh/Optimizer/split_inference_test" style="__INPUT__ flex:1; min-width:180px;">
+                    <input value="{{ e.expectedMin }}" sc-camel-on-change="{{ e.onExpected }}" placeholder="~min" title="Roughly how many minutes this project takes. Only used to fill the progress bar before the run reports its own numbers; blank is fine." style="__INPUT__ width:56px;">
+                    <button sc-camel-on-click="{{ e.onUp }}" title="Move up" style="{{ e.upStyle }}">&#9650;</button>
+                    <button sc-camel-on-click="{{ e.onDown }}" title="Move down" style="{{ e.downStyle }}">&#9660;</button>
+                    <button sc-camel-on-click="{{ e.onRemove }}" title="Remove from the queue" style="{{ e.removeStyle }}">&#10005;</button>
+                  </div>
                 </sc-for>
-              </select>
-              <button sc-camel-on-click="{{ prog.onRun }}" disabled="{{ prog.runDisabled }}" style="{{ prog.runStyle }}">{{ prog.runLabel }}</button>
-              <button sc-camel-on-click="{{ prog.onStop }}" disabled="{{ prog.stopDisabled }}" style="{{ prog.stopStyle }}">&#9632; Stop</button>
-              <span style="flex:1;"></span>
-              <span title="{{ prog.notifyTitle }}" style="{{ prog.notifyStyle }}">{{ prog.notifyLabel }}</span>
+                <div style="{{ prog.edit.emptyStyle }}">No projects yet. Add the directories you run &mdash; the commands are already saved on the Control tab.</div>
+                <div style="{{ prog.edit.errorStyle }}">{{ prog.edit.error }}</div>
+                <div style="display:flex; gap:7px; align-items:center; flex-wrap:wrap;">
+                  <button sc-camel-on-click="{{ prog.edit.onAdd }}" style="{{ prog.edit.addStyle }}">&#65291; Add project</button>
+                  <button sc-camel-on-click="{{ prog.edit.onImport }}" title="{{ prog.edit.importTitle }}" style="{{ prog.edit.importStyle }}">{{ prog.edit.importLabel }}</button>
+                  <span style="flex:1;"></span>
+                  <button sc-camel-on-click="{{ prog.edit.onCancel }}" style="{{ prog.edit.cancelStyle }}">Cancel</button>
+                  <button sc-camel-on-click="{{ prog.edit.onSave }}" style="{{ prog.edit.saveStyle }}">{{ prog.edit.saveLabel }}</button>
+                </div>
+              </div>
+
+              <!-- the schedule-script launcher, second because it is the -->
+              <!-- specialist: bash, for the projects that need more than a cd -->
+              <div style="display:flex; gap:9px; align-items:center; flex-wrap:wrap; padding-top:2px; border-top:1px solid var(--border);">
+                <span style="__CAPTION__">Schedule</span>
+                <select value="{{ prog.script }}" sc-camel-on-change="{{ prog.onScript }}" style="__INPUT__ flex:1; min-width:200px;">
+                  <sc-for list="{{ prog.scripts }}" as="s" hint-placeholder-count="2">
+                    <option value="{{ s.name }}" selected="{{ s.selected }}">{{ s.name }}</option>
+                  </sc-for>
+                </select>
+                <button sc-camel-on-click="{{ prog.onRun }}" disabled="{{ prog.runDisabled }}" style="{{ prog.runStyle }}">{{ prog.runLabel }}</button>
+              </div>
             </div>
 
             <!-- per-project board: one row per step, live counters on the open one -->
             <div class="prog-card" style="{{ prog.boardStyle }}">
+              <!-- the queue bar: projects settled, out of projects planned -->
+              <div style="{{ prog.queueStyle }}">
+                <div style="{{ prog.queueTrackStyle }}"><div class="prog-bar-fill" style="{{ prog.queueFillStyle }}"></div></div>
+                <span style="{{ prog.queueCountStyle }}">{{ prog.queueLabel }}</span>
+              </div>
               <sc-for list="{{ prog.steps }}" as="p" hint-placeholder-count="3">
-                <div style="{{ p.rowStyle }}">
+                <div style="{{ p.rowStyle }}" title="{{ p.title }}">
                   <span style="{{ p.dotStyle }}"></span>
                   <span style="flex:1; min-width:0; font-size:13px; font-weight:700; color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{{ p.name }}</span>
                   <span style="{{ p.metricStyle }}" class="num">{{ p.metrics }}</span>
                   <span style="font-size:11px; color:var(--muted); min-width:58px; text-align:right;" class="num">{{ p.duration }}</span>
                   <span style="{{ p.badgeStyle }}">{{ p.badge }}</span>
                 </div>
-                <div style="{{ p.barTrackStyle }}"><div style="{{ p.barFillStyle }}"></div></div>
+                <div style="{{ p.barTrackStyle }}" title="{{ p.barTitle }}"><div class="prog-bar-fill" style="{{ p.barFillStyle }}"></div></div>
               </sc-for>
-              <div style="{{ prog.emptyStyle }}">Nothing has run yet. Pick a schedule and press Run &mdash; it keeps going after you close this tab.</div>
+              <div style="{{ prog.emptyStyle }}">Nothing has run yet. Press <b>Run all projects</b> &mdash; it keeps going after you close this tab.</div>
             </div>
 
             <!-- transcript -->

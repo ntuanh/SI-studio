@@ -39,6 +39,9 @@ Component.prototype = {
 };
 var STARTED = [];
 var STOPPED = 0;
+var QUEUE_STARTED = [];
+var QUEUE_STOPPED = 0;
+var SAVED = [];
 var window = {
   confirm: function () { return true; },
   SplitInference: {
@@ -53,7 +56,19 @@ var window = {
       },
       autorunStop: function () { STOPPED++; return Promise.resolve({ stopped: true }); },
       autorunStatus: function () { return Promise.resolve({ active: null, notify: {} }); },
-      autorunScripts: function () { return Promise.resolve({ scripts: [] }); }
+      autorunScripts: function () { return Promise.resolve({ scripts: [] }); },
+      queueStart: function (opts) {
+        QUEUE_STARTED.push(opts || {});
+        return Promise.resolve({ run: { id: 'q1', running: true, steps: [] },
+                                 notify: { enabled: true } });
+      },
+      queueStop: function () { QUEUE_STOPPED++; return Promise.resolve({ stopped: true, jobs: 4 }); },
+      queueStatus: function () { return Promise.resolve({ active: null, notify: {}, targets: [] }); },
+      queueProjects: function () { return Promise.resolve({ projects: [] }); },
+      saveQueueProjects: function (projects) {
+        SAVED.push(projects);
+        return Promise.resolve({ projects: projects });
+      }
     }
   },
   addEventListener: function () {},
@@ -99,6 +114,44 @@ function pressRun(prog) {
   var self = makeSelf(prog);
   Component.prototype.progRun.call(self);
   return JSON.stringify({ started: STARTED, log: self.state.prog.log || [] });
+}
+
+function pressRunAll(prog) {
+  QUEUE_STARTED = [];
+  var self = makeSelf(prog);
+  Component.prototype.progRunAll.call(self);
+  return JSON.stringify({
+    started: QUEUE_STARTED, log: self.state.prog.log || [],
+    edit: self.state.prog.edit
+  });
+}
+
+function pressStop(prog) {
+  STOPPED = 0; QUEUE_STOPPED = 0;
+  var self = makeSelf(prog);
+  Component.prototype.progStop.call(self);
+  return JSON.stringify({ script: STOPPED, queue: QUEUE_STOPPED });
+}
+
+/* Drive the editor: open it, apply a list of [method, ...args] calls, and
+   report both the draft and whatever reached the API. */
+function editor(prog, steps, dirs) {
+  SAVED = [];
+  var self = makeSelf(prog);
+  self.state.siDirs = dirs || [];
+  Component.prototype.progEditToggle.call(self, true);
+  steps.forEach(function (s) {
+    Component.prototype[s[0]].apply(self, s.slice(1));
+  });
+  return JSON.stringify({
+    draft: self.state.prog.edit,
+    saved: SAVED,
+    err: self.state.prog.editErr || '',
+    vals: JSON.parse(JSON.stringify(
+      Component.prototype.progEditVals.call(self, self.state.prog),
+      function (k, v) { return typeof v === 'function' ? '[fn]' : v; }
+    ))
+  });
 }
 """
 
@@ -283,3 +336,232 @@ def test_run_without_a_script_does_not_call_the_api(js):
     out = json.loads(js.eval('pressRun({ script: "" })'))
     assert out["started"] == []
     assert any("pick a schedule" in l["text"] for l in out["log"])
+
+
+# =========================================================== the project queue
+PROJECTS = [
+    {"name": "split", "path": "ntuanh/Optimizer/split_inference_test",
+     "enabled": True, "expected_s": 720},
+    {"name": "PA", "path": "ntuanh/split_inference_test", "enabled": True, "expected_s": 540},
+    {"name": "dmsf", "path": "manh224353/split_inference", "enabled": False, "expected_s": 0},
+]
+
+QUEUE_RUN = {
+    "id": "q1a2b3c4",
+    "running": True,
+    "status": "running",
+    "duration_s": 90,
+    "expected_steps": 3,
+    "counts": {"total": 3, "ok": 1, "failed": 0, "running": 1, "stopped": 0},
+    "current_step": "PA",
+    "steps": [
+        {"index": 1, "name": "split", "status": "ok", "rc": 0, "duration_s": 712,
+         "progress": {}, "progress_text": ""},
+        {"index": 2, "name": "PA", "status": "running", "rc": None, "duration_s": 90,
+         "progress": {"phase": "3", "phases": "3", "elapsed_s": "90", "expected_s": "540"},
+         "progress_text": "running"},
+        {"index": 3, "name": "dmsf", "status": "queued", "rc": None, "duration_s": 0,
+         "progress": {"phase": "0", "phases": "3"}, "progress_text": "manh224353/split_inference"},
+    ],
+}
+
+
+def test_the_button_counts_the_projects_it_will_run(js):
+    """One click, and it says up front what it is about to do — the disabled
+    projects are not in the count because they are not in the run."""
+    R = vals(js, {"projects": PROJECTS})
+    assert R["runAllLabel"] == "▶ Run all 2 projects"
+    assert R["runAllDisabled"] is False
+    assert "split → PA" in R["runAllTitle"]
+
+
+def test_run_all_starts_the_queue_with_notifications(js):
+    out = json.loads(js.eval(f"pressRunAll({json.dumps({'projects': PROJECTS})})"))
+    assert out["started"] == [{"notify": True, "notifySteps": True}]
+    assert any("split → PA" in l["text"] for l in out["log"])
+
+
+def test_run_all_with_no_projects_opens_the_editor_instead_of_failing(js):
+    """They have not filled it in yet; the fix is the panel, not a red line."""
+    out = json.loads(js.eval("pressRunAll({ projects: [] })"))
+    assert out["started"] == []
+    assert out["edit"] == []
+    assert any("no projects yet" in l["text"] for l in out["log"])
+
+
+def test_stop_goes_to_whichever_launcher_is_running(js):
+    """The board does not distinguish the two, so neither should the button."""
+    q = json.loads(js.eval(f"pressStop({json.dumps({'run': QUEUE_RUN, 'source': 'queue'})})"))
+    assert (q["queue"], q["script"]) == (1, 0)
+
+    s = json.loads(js.eval(f"pressStop({json.dumps({'run': RUN, 'source': 'script'})})"))
+    assert (s["queue"], s["script"]) == (0, 1)
+
+
+# ------------------------------------------------------------- the queue bar
+def test_the_queue_bar_counts_settled_projects_against_the_plan(js):
+    """The plan is known before the first project starts, so this denominator
+    is a fact. One finished plus one open = 1.5 of 3."""
+    R = vals(js, {"run": QUEUE_RUN})
+    assert R["queueLabel"] == "1 of 3 done"
+    assert R["queuePct"] == pytest.approx(50.0)
+    assert R["queueStyle"] != "display:none;"
+
+
+def test_the_queue_bar_is_hidden_when_nothing_has_run(js):
+    assert vals(js, {"projects": PROJECTS})["queueStyle"] == "display:none;"
+
+
+# ------------------------------------------------- the per-project bar sources
+def test_the_bar_prefers_a_measured_denominator(js):
+    """batch/total is read out of the run's own output — it beats both of the
+    weaker sources whenever it is there."""
+    run = dict(QUEUE_RUN, steps=[dict(QUEUE_RUN["steps"][1], progress={
+        "batch": "128", "total": "256", "elapsed_s": "500", "expected_s": "540",
+        "phase": "3", "phases": "3"})])
+    row = vals(js, {"run": run})["steps"][0]
+    assert "50.0%" in row["barFillStyle"]
+    assert row["barTitle"].startswith("measured:")
+
+
+def test_the_bar_falls_back_to_the_operators_estimate(js):
+    """No batch counter, but the editor supplied an expected duration."""
+    row = vals(js, {"run": QUEUE_RUN})["steps"][1]
+    assert row["barTitle"].startswith("estimated:")
+    assert "16.7%" in row["barFillStyle"]
+
+
+def test_an_overrunning_estimate_never_claims_the_run_is_over(js):
+    """Overrunning the estimate is the most common thing for it to do, and a
+    full bar on a still-running project reads as finished."""
+    run = dict(QUEUE_RUN, steps=[dict(QUEUE_RUN["steps"][1], progress={
+        "elapsed_s": "5400", "expected_s": "540"})])
+    row = vals(js, {"run": run})["steps"][0]
+    assert "97.0%" in row["barFillStyle"]
+
+
+def test_the_bar_falls_back_to_the_launch_phase(js):
+    """Structural, always available: server up, then each stage launched. It is
+    what a project with no counters and no estimate still honestly has."""
+    run = dict(QUEUE_RUN, steps=[dict(QUEUE_RUN["steps"][1],
+                                      progress={"phase": "2", "phases": "3"})])
+    row = vals(js, {"run": run})["steps"][0]
+    assert row["barTitle"].startswith("launching:")
+    assert "66.7%" in row["barFillStyle"]
+
+
+def test_with_no_source_at_all_there_is_still_no_bar(js):
+    """The rule the schedule scripts have always followed survives the rework:
+    a bar with a made-up denominator is worse than no bar."""
+    run = dict(QUEUE_RUN, steps=[dict(QUEUE_RUN["steps"][1], progress={})])
+    assert vals(js, {"run": run})["steps"][0]["barTrackStyle"] == "display:none;"
+
+
+def test_a_queued_project_is_on_the_board_but_reports_no_runtime(js):
+    """The whole plan is visible from the start; a row that has not begun must
+    not show a duration or a bar."""
+    row = vals(js, {"run": QUEUE_RUN})["steps"][2]
+    assert row["badge"] == "queued"
+    assert row["duration"] == ""
+    assert row["barTrackStyle"] == "display:none;"
+
+
+# ------------------------------------------------------------- the editor
+def _edit(js, prog, steps, dirs=None):
+    return json.loads(js.eval(
+        f"editor({json.dumps(prog)}, {json.dumps(steps)}, {json.dumps(dirs or [])})"
+    ))
+
+
+def test_opening_the_editor_drafts_the_saved_projects(js):
+    out = _edit(js, {"projects": PROJECTS}, [])
+    assert [r["path"] for r in out["draft"]] == [p["path"] for p in PROJECTS]
+    # Seconds are shown as minutes: nobody thinks about a project in seconds.
+    assert out["draft"][0]["expectedMin"] == "12"
+    assert out["draft"][2]["enabled"] is False
+
+
+def test_edits_do_not_reach_the_server_until_save(js):
+    out = _edit(js, {"projects": PROJECTS}, [["progEditPatch", 0, {"path": "half-typed"}]])
+    assert out["saved"] == []
+    assert out["draft"][0]["path"] == "half-typed"
+
+
+def test_saving_sends_the_list_in_editor_order(js):
+    out = _edit(js, {"projects": PROJECTS}, [
+        ["progEditMove", 2, -1],
+        ["progEditSave"],
+    ])
+    assert [p["name"] for p in out["saved"][0]] == ["split", "dmsf", "PA"]
+
+
+def test_minutes_are_converted_back_to_seconds(js):
+    out = _edit(js, {"projects": PROJECTS}, [
+        ["progEditPatch", 0, {"expectedMin": "9"}],
+        ["progEditSave"],
+    ])
+    assert out["saved"][0][0]["expected_s"] == 540
+
+
+def test_a_blank_estimate_stays_blank_rather_than_becoming_zero_minutes(js):
+    out = _edit(js, {"projects": PROJECTS}, [
+        ["progEditPatch", 0, {"expectedMin": ""}],
+        ["progEditSave"],
+    ])
+    assert out["saved"][0][0]["expected_s"] == 0
+
+
+def test_adding_and_removing_rows(js):
+    out = _edit(js, {"projects": PROJECTS}, [
+        ["progEditRemove", 1],
+        ["progEditAdd", "new/project", "new"],
+        ["progEditSave"],
+    ])
+    assert [p["name"] for p in out["saved"][0]] == ["split", "dmsf", "new"]
+
+
+def test_a_row_with_no_directory_is_dropped_rather_than_saved(js):
+    out = _edit(js, {"projects": PROJECTS}, [["progEditAdd"], ["progEditSave"]])
+    assert len(out["saved"][0]) == 3
+
+
+def test_two_projects_on_one_directory_is_refused(js):
+    """The second would run in a directory the first has just written its
+    results into."""
+    out = _edit(js, {"projects": PROJECTS}, [
+        ["progEditPatch", 1, {"path": PROJECTS[0]["path"]}],
+        ["progEditSave"],
+    ])
+    assert out["saved"] == []
+    assert "share the directory" in out["err"]
+
+
+def test_control_directories_can_be_imported(js):
+    """They are almost always the projects, and a path one tab away cannot be
+    retyped wrong if it is not retyped."""
+    dirs = [{"label": "split_inference_test", "path": "ntuanh/Optimizer/split_inference_test"},
+            {"label": "SplittingYOLO", "path": "ntuanh/SplittingYOLO"}]
+    out = _edit(js, {"projects": []}, [["progEditImport"], ["progEditSave"]], dirs)
+    assert [p["name"] for p in out["saved"][0]] == ["split_inference_test", "SplittingYOLO"]
+
+
+def test_importing_skips_directories_already_in_the_list(js):
+    """Pressing it twice must not double the queue."""
+    dirs = [{"label": "split_inference_test", "path": "ntuanh/Optimizer/split_inference_test"}]
+    out = _edit(js, {"projects": PROJECTS}, [["progEditImport"]], dirs)
+    assert len(out["draft"]) == len(PROJECTS)
+    assert out["err"] == "every saved directory is already listed"
+
+
+def test_the_editor_shows_what_will_actually_run(js):
+    """The commands live on the Control tab, so without this the editor looks
+    like it is missing half its fields."""
+    out = _edit(js, {"projects": PROJECTS, "targets": [
+        {"key": "__server__", "label": "Control server",
+         "command": "python3 server.py", "devices": ["__server__"]},
+        {"key": "sA", "label": "Edge", "command": "python3 client.py --layer_id 1",
+         "devices": ["d1", "d2"]},
+    ]}, [])
+    plan = out["vals"]["plan"]
+    assert [p["label"] for p in plan] == ["Control server", "Edge"]
+    assert plan[1]["hosts"] == "2 host(s)"

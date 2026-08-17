@@ -299,6 +299,61 @@
     return (i === 0 ? n : n.toFixed(1)) + ' ' + units[i];
   }
 
+  /* ---- how full one project's bar is, and on what authority ---------------
+   *
+   * Three possible denominators, tried strongest first, because they are not
+   * equally good evidence and the bar should not pretend they are:
+   *
+   *   batch/total       measured — the run's own output said both numbers
+   *   elapsed/expected  estimated — the operator typed a duration in the editor
+   *   phase/phases      structural — server launched, then each stage launched
+   *
+   * A source is only used when *both* halves of its fraction are real. There is
+   * no fourth branch that guesses: a project revealing none of these gets no
+   * bar, which is the same rule the schedule scripts have always followed
+   * ("supply `total=` and the row gets a progress bar").
+   *
+   * Returns `{show, pct, basis, color}`; `basis` is what the tooltip says, so
+   * a 40% bar can always be asked what it is 40% of.
+   */
+  function progBarOf(p, status) {
+    var progress = p || {};
+    function num(v) {
+      var n = Number(v);
+      return v == null || v === '' || !isFinite(n) ? null : n;
+    }
+    var pct = 0, basis = '';
+
+    var batch = num(progress.batch), total = num(progress.total);
+    var elapsed = num(progress.elapsed_s), expected = num(progress.expected_s);
+    var phase = num(progress.phase), phases = num(progress.phases);
+
+    if (batch != null && total != null && total > 0) {
+      pct = (batch / total) * 100;
+      basis = 'measured: batch ' + batch + ' of ' + total;
+    } else if (elapsed != null && expected != null && expected > 0) {
+      // Capped just short of full: an estimate that reaches 100% claims the
+      // run is over, and this one is still going -- overrunning the estimate
+      // is the single most common thing for it to do.
+      pct = Math.min((elapsed / expected) * 100, 97);
+      basis = 'estimated: ' + Math.round(elapsed) + 's of about ' + Math.round(expected) + 's';
+    } else if (phase != null && phases != null && phases > 0) {
+      pct = (phase / phases) * 100;
+      basis = 'launching: phase ' + phase + ' of ' + phases;
+    } else {
+      return { show: false, pct: 0, basis: '', color: 'var(--data)' };
+    }
+
+    if (status === 'ok') { pct = 100; basis = 'finished'; }
+    pct = Math.max(0, Math.min(100, pct));
+    return {
+      show: status === 'running',
+      pct: pct,
+      basis: basis,
+      color: status === 'failed' ? 'var(--alert)' : 'var(--data)'
+    };
+  }
+
   /* Compare mode's column accents, in slot order. Three, because three is the
    * limit: a fourth column drawn on a 1400px page is 300px of chart, which is
    * narrower than the figures were rendered for. */
@@ -843,6 +898,19 @@
       if (boot.baseUrl != null) cfg.baseUrl = boot.baseUrl || window.location.origin;
       if (boot.token) cfg.token = boot.token;
       if (Object.keys(cfg).length) SI.configure(cfg);
+
+      /* Ask what is running before anyone asks for it.
+       *
+       * A queue is started and then left for hours, so the interesting page
+       * load is the one that happens *during* it -- from another machine, or
+       * after a reload. Stream frames only announce what happens next, so
+       * without this the rail badge stays dark and the board stays empty until
+       * the operator thinks to click Progress, which is exactly backwards: the
+       * dot exists to tell them there is something to click.
+       *
+       * Deliberately after `SI.configure`, or the two calls would go out
+       * without the injected token and be quietly refused. */
+      this.progLoad();
 
       // The card's port/user/password now mean SSH, so 5672 (the old AMQP
       // default baked into `state`) would be wrong on first paint.
@@ -2040,30 +2108,87 @@
       });
     },
 
-    /* Load the script list and whatever is already running. Safe to call
-     * repeatedly; it is what the tab does on every entry. */
+    /* Load the script list, the project list, and whatever is already running.
+     * Safe to call repeatedly; it is what the tab does on every entry.
+     *
+     * Two launchers report to one board, so this asks both and shows whichever
+     * is actually running. They cannot both be running -- the backend holds one
+     * lock across the pair, because they drive the same fleet. */
     progLoad: function () {
       var self = this;
-      return Promise.all([SI.api.autorunStatus(), SI.api.autorunScripts()])
-        .then(function (res) {
-          var status = res[0] || {};
-          var scripts = (res[1] || {}).scripts || [];
-          var cur = (self.state.prog || {}).script;
-          self.progPatch({
-            run: status.active || null,
-            notify: status.notify || {},
-            stallAfter: status.stall_after_s,
-            scripts: scripts,
-            // Prefer the running script, then whatever was picked, then the
-            // fleet schedule if it is there, then simply the first.
-            script: (status.active && status.active.script &&
-                     self.progShort(status.active.script)) || cur ||
-                    self.progDefaultScript(scripts),
-            loaded: true
-          });
+      var settled = function (p) {
+        return p.then(function (v) { return v; }, function () { return null; });
+      };
+      return Promise.all([
+        settled(SI.api.autorunStatus()),
+        settled(SI.api.autorunScripts()),
+        settled(SI.api.queueStatus()),
+        settled(SI.api.queueProjects())
+      ]).then(function (res) {
+        var status = res[0] || {};
+        var scripts = (res[1] || {}).scripts || [];
+        var queue = res[2] || {};
+        var projects = (res[3] || {}).projects || [];
+        var cur = (self.state.prog || {}).script;
+        var active = queue.active || status.active || null;
+        self.progPatch({
+          run: active,
+          source: (queue.active ? 'queue' : status.active ? 'script' : ''),
+          notify: queue.notify || status.notify || {},
+          stallAfter: status.stall_after_s,
+          scripts: scripts,
+          projects: projects,
+          targets: queue.targets || [],
+          // Prefer the running script, then whatever was picked, then the
+          // fleet schedule if it is there, then simply the first.
+          script: (status.active && status.active.script &&
+                   self.progShort(status.active.script)) || cur ||
+                  self.progDefaultScript(scripts),
+          loaded: true
+        });
+      }).catch(function (e) {
+        self.progPatch({ loaded: true, error: errText(e) });
+      });
+    },
+
+    /* ---- the queue: every project, one button ---------------------------
+     *
+     * The whole point of the feature. Everything it needs was configured
+     * elsewhere already -- the projects here, the commands as Control presets,
+     * the logins in the device rows -- so this is deliberately a button with no
+     * options on it. Anything that needs deciding is decided in the editor,
+     * once, not in a dialog every time.
+     */
+    progRunAll: function () {
+      var self = this;
+      var prog = this.state.prog || {};
+      if (!SI.isLive() && !SI.config.baseUrl) {
+        this.progLog('✗ no backend configured — click the header chip', C.err);
+        return;
+      }
+      var enabled = (prog.projects || []).filter(function (p) { return p.enabled; });
+      if (!enabled.length) {
+        // Not an error worth a red line: they have simply not filled it in yet,
+        // and the fix is the panel this opens.
+        this.progLog('· no projects yet — add the directories you run', C.hint);
+        return this.progEditToggle(true);
+      }
+
+      this.progPatch({ qbusy: true, error: '' });
+      this.progLog('▶ running ' + enabled.length + ' project(s): ' +
+        enabled.map(function (p) { return p.name; }).join(' → '), C.info);
+      return SI.api.queueStart({ notify: true, notifySteps: true })
+        .then(function (body) {
+          self.progPatch({ run: body.run || null, source: 'queue', qbusy: false });
+          var n = (body.notify || {});
+          if (!n.enabled) {
+            self.progLog('  (Telegram is off — set TELEGRAM_BOT_TOKEN to get alerts)', C.hint);
+          }
+          self.siOpenStream();
         })
         .catch(function (e) {
-          self.progPatch({ loaded: true, error: errText(e) });
+          self.progPatch({ qbusy: false, error: errText(e) });
+          self.progLog('✗ ' + errText(e), C.err);
         });
     },
 
@@ -2106,16 +2231,152 @@
         });
     },
 
+    /* Stop whichever launcher is running. The board does not distinguish them
+     * and neither should this button: "stop what I am watching" is the whole
+     * request, and asking which subsystem owns it would be a quiz. */
     progStop: function () {
       var self = this;
-      this.progLog('^C stopping the schedule', C.warn);
-      return SI.api.autorunStop()
+      var queue = (this.state.prog || {}).source === 'queue';
+      this.progLog('^C stopping the ' + (queue ? 'queue' : 'schedule'), C.warn);
+      return (queue ? SI.api.queueStop() : SI.api.autorunStop())
         .then(function (body) {
           if (!body.stopped) self.progLog('  nothing was running', C.hint);
-          else self.progLog('  ' + (body.outcome || 'stopped'), C.warn);
+          else if (body.jobs != null) {
+            self.progLog('  interrupted ' + body.jobs + ' job(s)', C.warn);
+          } else self.progLog('  ' + (body.outcome || 'stopped'), C.warn);
           return self.progLoad();
         })
         .catch(function (e) { self.progLog('✗ ' + errText(e), C.err); });
+    },
+
+    /* ==================================================================
+     * The project editor.
+     *
+     * Edits go into a draft (`prog.edit`) and reach the server only on Save.
+     * A list of directories is not a setting you tweak and watch -- it is a
+     * plan you write down and then check, and a PUT per keystroke would mean
+     * a half-typed path is briefly the real one.
+     * ================================================================== */
+    progEditToggle: function (open) {
+      var prog = this.state.prog || {};
+      var wanted = open == null ? !prog.edit : !!open;
+      if (!wanted) return this.progPatch({ edit: null, editErr: '' });
+      this.progPatch({
+        edit: (prog.projects || []).map(function (p) {
+          return {
+            name: p.name || '', path: p.path || '',
+            enabled: p.enabled !== false,
+            expectedMin: p.expected_s ? String(Math.round(p.expected_s / 60)) : '',
+            overrides: Object.assign({}, p.overrides || {})
+          };
+        }),
+        editErr: ''
+      });
+    },
+
+    progEditPatch: function (index, patch) {
+      this.setState(function (s) {
+        var prog = s.prog || {};
+        var rows = (prog.edit || []).slice();
+        if (!rows[index]) return null;
+        rows[index] = Object.assign({}, rows[index], patch);
+        return { prog: Object.assign({}, prog, { edit: rows, editErr: '' }) };
+      });
+    },
+
+    progEditAdd: function (path, name) {
+      this.setState(function (s) {
+        var prog = s.prog || {};
+        var rows = (prog.edit || []).slice();
+        rows.push({
+          name: name || '', path: path || '', enabled: true,
+          expectedMin: '', overrides: {}
+        });
+        return { prog: Object.assign({}, prog, { edit: rows, editErr: '' }) };
+      });
+    },
+
+    progEditRemove: function (index) {
+      this.setState(function (s) {
+        var prog = s.prog || {};
+        var rows = (prog.edit || []).slice();
+        rows.splice(index, 1);
+        return { prog: Object.assign({}, prog, { edit: rows, editErr: '' }) };
+      });
+    },
+
+    /* Order is the run order, so moving a row is how "do dmsf last" is said. */
+    progEditMove: function (index, delta) {
+      this.setState(function (s) {
+        var prog = s.prog || {};
+        var rows = (prog.edit || []).slice();
+        var to = index + delta;
+        if (to < 0 || to >= rows.length) return null;
+        var row = rows[index];
+        rows[index] = rows[to];
+        rows[to] = row;
+        return { prog: Object.assign({}, prog, { edit: rows, editErr: '' }) };
+      });
+    },
+
+    /* The directories already saved on Control are almost always the projects.
+     * Offering them beats retyping a path that is one tab away and, unlike a
+     * retyped one, cannot be typed wrong. */
+    progEditImport: function () {
+      var have = {};
+      ((this.state.prog || {}).edit || []).forEach(function (r) {
+        have[(r.path || '').replace(/\/+$/, '')] = true;
+      });
+      var added = 0;
+      var self = this;
+      (this.state.siDirs || []).forEach(function (d) {
+        if (have[(d.path || '').replace(/\/+$/, '')]) return;
+        self.progEditAdd(d.path, d.label);
+        added++;
+      });
+      if (!added) this.progPatch({ editErr: 'every saved directory is already listed' });
+    },
+
+    progEditSave: function () {
+      var self = this;
+      var rows = ((this.state.prog || {}).edit || [])
+        .filter(function (r) { return (r.path || '').trim(); });
+
+      // Two projects on one directory is not a plan, it is a typo: the second
+      // would run in a directory the first has just written results into.
+      var seen = {};
+      for (var i = 0; i < rows.length; i++) {
+        var key = rows[i].path.trim().replace(/\/+$/, '');
+        if (seen[key]) {
+          this.progPatch({ editErr: 'two projects share the directory ' + key });
+          return;
+        }
+        seen[key] = true;
+      }
+
+      var payload = rows.map(function (r) {
+        var minutes = parseFloat(r.expectedMin);
+        return {
+          name: (r.name || '').trim(),
+          path: r.path.trim(),
+          enabled: r.enabled !== false,
+          expected_s: isFinite(minutes) && minutes > 0 ? Math.round(minutes * 60) : 0,
+          overrides: r.overrides || {}
+        };
+      });
+
+      this.progPatch({ editBusy: true, editErr: '' });
+      return SI.api.saveQueueProjects(payload)
+        .then(function (body) {
+          self.progPatch({
+            projects: body.projects || [], edit: null,
+            editBusy: false, editErr: ''
+          });
+          self.progLog('✓ saved ' + (body.projects || []).length + ' project(s)', C.ok);
+        })
+        .catch(function (e) {
+          self.progPatch({ editBusy: false, editErr: errText(e) });
+        });
     },
 
     /* Stream frames. Kept in one place so the board's rules are readable:
@@ -2188,15 +2449,16 @@
           self.progPatch({ script: v });
         },
         onRun: function () { self.progRun(); },
+        onRunAll: function () { self.progRunAll(); },
         onStop: function () { self.progStop(); },
         onClear: function () { self.progPatch({ log: [] }); },
 
-        runLabel: running ? 'Running…' : (prog.busy ? 'Starting…' : '▶ Run schedule'),
+        runLabel: running ? 'Running…' : (prog.busy ? 'Starting…' : '▶ Run script'),
         runDisabled: running || !!prog.busy || !prog.script,
         stopDisabled: !running,
         runStyle: btn + (running || prog.busy
           ? 'background:var(--bg); color:var(--muted); cursor:progress;'
-          : 'background:var(--alert); color:#fff; border-color:transparent;'),
+          : 'background:var(--surface); color:var(--ink);'),
         stopStyle: btn + (running
           ? 'background:var(--surface); color:var(--ink);'
           : 'background:var(--bg); color:var(--muted); cursor:not-allowed;'),
@@ -2214,6 +2476,10 @@
 
         logTitle: run ? 'auto-run ' + run.id : 'auto-run transcript',
         log: (prog.log || []).map(function (l) { return { text: l.text, color: l.color }; }),
+        errorText: prog.error || '',
+        errorStyle: prog.error
+          ? 'font-size:11px; color:var(--alert); padding:2px 2px 0;'
+          : 'display:none;',
 
         boardStyle: (run && (run.steps || []).length)
           ? 'display:flex; flex-direction:column; gap:7px;'
@@ -2223,10 +2489,29 @@
           : 'font-size:12px; color:var(--muted); padding:6px 2px;'
       };
 
+      // --- the one button ------------------------------------------------
+      var projects = prog.projects || [];
+      var enabled = projects.filter(function (p) { return p.enabled !== false; });
+      R.projectCount = enabled.length;
+      R.runAllLabel = running && prog.source === 'queue' ? 'Running…'
+        : prog.qbusy ? 'Starting…'
+        : enabled.length ? '▶ Run all ' + enabled.length + ' projects'
+        : '▶ Run all projects';
+      R.runAllDisabled = running || !!prog.qbusy;
+      R.runAllTitle = enabled.length
+        ? 'Runs, in order: ' + enabled.map(function (p) { return p.name; }).join(' → ') +
+          '. Each one gets the server started, then every stage, in its own directory.'
+        : 'No projects yet — press Edit projects and add the directories you run';
+      R.runAllStyle = btn + 'padding:9px 16px; font-size:13px;' + (R.runAllDisabled
+        ? 'background:var(--bg); color:var(--muted); cursor:progress;'
+        : 'background:var(--alert); color:#fff; border-color:transparent;');
+
       // --- headline ------------------------------------------------------
       if (!run) {
         R.headline = 'Idle';
-        R.headlineSub = (prog.scripts || []).length + ' schedule(s) available';
+        R.headlineSub = enabled.length
+          ? enabled.length + ' project(s) ready'
+          : (prog.scripts || []).length + ' schedule(s) available';
       } else {
         R.headline = running
           ? (run.current_step || 'starting…')
@@ -2238,53 +2523,193 @@
         'border:1px solid var(--border); background:var(--raised);' +
         (running ? 'box-shadow:inset 3px 0 0 var(--alert);' : '');
 
+      /* --- the queue bar --------------------------------------------------
+       *
+       * The one bar whose denominator is never in doubt: the plan is known
+       * before the first project starts, so "2 of 6" is a fact rather than an
+       * extrapolation. Anything still open counts as half, which is the only
+       * honest thing to say about a project that has started and not finished
+       * -- and it means the bar moves when a project begins, not only when it
+       * ends, which is what stops it reading as stuck for twenty minutes.
+       */
+      var planned = (run && run.expected_steps) || (run && (run.steps || []).length) || 0;
+      var settled = (counts.ok || 0) + (counts.failed || 0) + (counts.stopped || 0);
+      var queuePct = planned
+        ? Math.max(0, Math.min(100, ((settled + (counts.running || 0) * 0.5) / planned) * 100))
+        : 0;
+      R.queuePct = queuePct;
+      R.queueLabel = planned ? settled + ' of ' + planned + ' done' : '';
+      R.queueStyle = run
+        ? 'display:flex; align-items:center; gap:10px; padding:2px 2px 4px;'
+        : 'display:none;';
+      R.queueTrackStyle = 'flex:1; height:6px; border-radius:3px; background:var(--border);' +
+        'overflow:hidden;';
+      R.queueFillStyle = 'height:6px; border-radius:3px; width:' + queuePct.toFixed(1) + '%;' +
+        'background:' + (run && run.status === 'failed' ? 'var(--alert)'
+          : running ? 'var(--data)' : 'var(--edge)') + ';';
+      R.queueCountStyle = 'font-size:11px; color:var(--muted); white-space:nowrap;' +
+        'font-family:ui-monospace,monospace;';
+
       // --- one row per project -------------------------------------------
       var DOT = { ok: 'var(--edge)', failed: 'var(--alert)', running: 'var(--data)',
-                  stopped: 'var(--muted)' };
+                  stopped: 'var(--muted)', queued: 'var(--border)' };
       R.steps = ((run && run.steps) || []).map(function (s) {
         var p = s.progress || {};
         var isRun = s.status === 'running';
+        var isQueued = s.status === 'queued';
 
         // The metric strip is the answer to "how far in is it": batch index
         // first because that is what moves, fps second because that is what
         // the run is for.
         var bits = [];
-        if (p.batch != null) bits.push('batch ' + p.batch);
+        if (p.batch != null) bits.push('batch ' + p.batch + (p.total ? '/' + p.total : ''));
         if (p.fps != null && Number(p.fps) > 0) bits.push(Number(p.fps).toFixed(2) + ' fps');
         if (p.reg) bits.push('reg ' + p.reg);
         if (p.archive) bits.push(p.archive);
         if (!bits.length && s.progress_text) bits.push(s.progress_text);
 
-        // A percentage only when the script actually said what the total is;
-        // inventing a denominator would make the bar a lie.
-        var pct = 0;
-        if (p.batch != null && p.total != null && Number(p.total) > 0) {
-          pct = Math.max(0, Math.min(100, (Number(p.batch) / Number(p.total)) * 100));
-        }
+        /* The bar takes the best denominator it actually has, and says which
+         * one it took. In falling order of honesty:
+         *
+         *   1. batch/total   — a measurement, read out of the run's own output
+         *   2. elapsed/expected — an estimate the operator typed in the editor
+         *   3. phase/phases  — structural: server up, then each stage launched
+         *
+         * Nothing invents one. A project that reveals none of the three has no
+         * bar, exactly as before -- a bar with a made-up denominator is worse
+         * than no bar, because it looks like knowledge.
+         */
+        var bar = progBarOf(p, s.status);
 
         return {
           name: s.name,
           metrics: bits.join(' · '),
-          duration: self.progDur(s.duration_s),
+          duration: isQueued ? '' : self.progDur(s.duration_s),
+          title: s.detail || s.progress_text || s.name,
           badge: s.status === 'ok' ? '✔' : s.status === 'failed' ? 'rc ' + s.rc
-               : s.status === 'stopped' ? '■' : '',
+               : s.status === 'stopped' ? '■' : isQueued ? 'queued' : '',
           rowStyle: 'display:flex; align-items:center; gap:9px; padding:7px 9px;' +
-            'border-radius:9px; background:' + (isRun ? 'var(--bg)' : 'transparent') + ';',
+            'border-radius:9px; background:' + (isRun ? 'var(--bg)' : 'transparent') + ';' +
+            (isQueued ? 'opacity:.62;' : ''),
           dotStyle: 'width:9px; height:9px; border-radius:50%; flex-shrink:0; background:' +
-            (DOT[s.status] || 'var(--muted)') + ';',
+            (DOT[s.status] || 'var(--muted)') + ';' +
+            (isQueued ? 'box-shadow:inset 0 0 0 1px var(--muted); background:transparent;' : ''),
           metricStyle: 'font-size:11px; color:var(--muted); font-family:ui-monospace,monospace;' +
             'overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:280px;',
-          badgeStyle: 'font-size:11px; font-weight:700; min-width:34px; text-align:right; color:' +
-            (s.status === 'failed' ? 'var(--alert)' : s.status === 'ok' ? 'var(--edge)' : 'var(--muted)') + ';',
-          barTrackStyle: (isRun && pct > 0)
+          badgeStyle: 'font-size:11px; font-weight:700; min-width:44px; text-align:right; color:' +
+            (s.status === 'failed' ? 'var(--alert)' : s.status === 'ok' ? 'var(--edge)'
+              : 'var(--muted)') + ';' + (isQueued ? 'font-weight:500; font-size:10px;' : ''),
+          // Hovering says what the bar is measuring. Without it a bar at 40%
+          // is an unattributed claim, and the three sources are not equally
+          // strong -- "phase 2 of 3" is a very different statement from
+          // "batch 512 of 905".
+          barTitle: bar.basis,
+          barTrackStyle: bar.show
             ? 'height:3px; border-radius:2px; background:var(--border); margin:0 9px 3px;'
             : 'display:none;',
-          barFillStyle: 'height:3px; border-radius:2px; background:var(--data); width:' +
-            pct.toFixed(1) + '%;'
+          barFillStyle: 'height:3px; border-radius:2px; width:' + bar.pct.toFixed(1) + '%;' +
+            'background:' + bar.color + ';'
         };
       });
-      R.steps.forEach(function (s) { s.barFillClass = 'prog-bar-fill'; });
+      R.edit = self.progEditVals(prog);
       return R;
+    },
+
+    /* Everything the editor panel binds to. Same contract as
+     * `progRenderVals`: reads the draft, returns values, mutates nothing. */
+    progEditVals: function (prog) {
+      var self = this;
+      var rows = prog.edit;
+      var open = !!rows;
+      var dirs = this.state.siDirs || [];
+
+      var small = 'border:1px solid var(--border); border-radius:7px; padding:5px 9px;' +
+                  'font-size:11px; font-weight:600; cursor:pointer; background:var(--surface);' +
+                  'color:var(--ink);';
+
+      var E = {
+        open: open,
+        panelStyle: open
+          ? 'display:flex; flex-direction:column; gap:8px;'
+          : 'display:none;',
+        toggleLabel: open ? '✕ Close editor' : '⚙ Edit projects',
+        toggleTitle: 'The directories the queue runs, in order. Only the directory '
+          + 'changes between projects — the commands are the Control tab presets.',
+        toggleStyle: 'padding:8px 12px; border-radius:9px; border:1px solid var(--border);'
+          + 'font-size:12px; font-weight:700; cursor:pointer; background:var(--surface);'
+          + 'color:var(--ink);',
+        onToggle: function () { self.progEditToggle(); },
+        onAdd: function () { self.progEditAdd(); },
+        onImport: function () { self.progEditImport(); },
+        importLabel: '＋ from Control directories (' + dirs.length + ')',
+        importTitle: dirs.length
+          ? 'Add the working directories saved on the Control tab: '
+            + dirs.map(function (d) { return d.path; }).join(', ')
+          : 'No directories are saved on the Control tab yet',
+        importStyle: small + (dirs.length ? '' : 'opacity:.5; cursor:not-allowed;'),
+        addStyle: small,
+        onSave: function () { self.progEditSave(); },
+        onCancel: function () { self.progEditToggle(false); },
+        saveLabel: prog.editBusy ? 'Saving…' : 'Save projects',
+        saveStyle: 'padding:7px 13px; border-radius:8px; border:none; font-size:12px;'
+          + 'font-weight:700; cursor:pointer; color:#fff;'
+          + 'background:' + (prog.editBusy ? 'var(--muted)' : 'var(--edge)') + ';',
+        cancelStyle: small,
+        error: prog.editErr || '',
+        errorStyle: prog.editErr
+          ? 'font-size:11px; color:var(--alert);'
+          : 'display:none;',
+        emptyStyle: (rows && rows.length) ? 'display:none;'
+          : 'font-size:12px; color:var(--muted); padding:6px 2px;',
+        // Says, in the panel where it matters, what will actually be run in
+        // each of these directories. The commands live on Control, so without
+        // this the editor looks like it is missing half its fields.
+        plan: (prog.targets || []).map(function (t) {
+          return { label: t.label, command: t.command,
+                   hosts: (t.devices || []).length + ' host(s)' };
+        }),
+        planStyle: (prog.targets || []).length
+          ? 'font-size:11px; color:var(--muted); display:flex; flex-direction:column; gap:2px;'
+            + 'padding:7px 9px; border-radius:8px; background:var(--bg);'
+          : 'display:none;',
+        rows: []
+      };
+
+      E.rows = (rows || []).map(function (r, i) {
+        return {
+          name: r.name || '',
+          path: r.path || '',
+          expectedMin: r.expectedMin || '',
+          check: r.enabled !== false ? '✓' : '',
+          checkTitle: r.enabled !== false
+            ? 'Included when you press Run all — click to skip it'
+            : 'Skipped. It stays in the list and keeps its place in the order.',
+          checkStyle: 'width:16px; height:16px; border-radius:5px; flex-shrink:0;'
+            + 'display:flex; align-items:center; justify-content:center; cursor:pointer;'
+            + 'font-size:10px; color:#fff; border:1px solid '
+            + (r.enabled !== false ? 'var(--edge)' : 'var(--border)') + ';'
+            + 'background:' + (r.enabled !== false ? 'var(--edge)' : 'transparent') + ';',
+          onToggle: function () { self.progEditPatch(i, { enabled: r.enabled === false }); },
+          onName: function (e) { self.progEditPatch(i, { name: e.target.value }); },
+          onPath: function (e) { self.progEditPatch(i, { path: e.target.value }); },
+          onExpected: function (e) { self.progEditPatch(i, { expectedMin: e.target.value }); },
+          onUp: function () { self.progEditMove(i, -1); },
+          onDown: function () { self.progEditMove(i, 1); },
+          onRemove: function () { self.progEditRemove(i); },
+          upStyle: 'border:none; background:none; cursor:' + (i ? 'pointer' : 'not-allowed')
+            + '; color:' + (i ? 'var(--muted)' : 'var(--border)') + '; font-size:11px; padding:0 2px;',
+          downStyle: 'border:none; background:none; cursor:'
+            + (i < (rows || []).length - 1 ? 'pointer' : 'not-allowed') + '; color:'
+            + (i < (rows || []).length - 1 ? 'var(--muted)' : 'var(--border)')
+            + '; font-size:11px; padding:0 2px;',
+          removeStyle: 'border:none; background:none; cursor:pointer; color:var(--muted);'
+            + 'font-size:13px; padding:0 3px;',
+          rowStyle: 'display:flex; align-items:center; gap:7px; padding:5px 2px;'
+            + (r.enabled === false ? 'opacity:.55;' : ''),
+          index: String(i + 1)
+        };
+      });
+      return E;
     },
 
     progDur: function (seconds) {

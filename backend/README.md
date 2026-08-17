@@ -173,6 +173,10 @@ authorize by hand.
 | GET | `/autorun/tail`, `/autorun/history` | live output; past runs, newest first |
 | GET | `/autorun/runs/{id}/log` | a past run's full transcript |
 | POST | `/autorun/notify/test` | verify Telegram before trusting it overnight |
+| POST | `/queue/start` | run every saved project back to back — see [The project queue](#the-project-queue-every-project-one-button) |
+| POST | `/queue/stop` | `^C` the open project, cancel the rest |
+| GET | `/queue/status` | active queue, the resolved plan, notification wiring |
+| GET/PUT | `/queue/projects` | the editable project list, in run order |
 | GET | `/export` | inventory back in the UI's export shape (no credentials) |
 | WS | `/ws/stream` | `ssh_status`, `exec_line`, `metrics`, `event` frames |
 | GET | `/`, `/runtime-config.js`, `/{asset}` | the website (no token; see above) |
@@ -720,18 +724,19 @@ is scrubbed from every log line and error string, and no endpoint returns it.
 
 ### The Progress tab
 
-The eighth rail item, and the front end of all of the above: pick a schedule,
-press **▶ Run**, and watch a per-project board — one row each, a live dot, the
-batch counter and FPS as they move, a bar when the script said what the total
-is, and a verdict when it lands. The transcript streams underneath. It is a
-board rather than a console because a schedule is hours long and unattended,
-where the only questions are which project is up, how far in, and whether
-anything broke; Control's console answers a different question and is still
-there for it.
+The eighth rail item, and the front end of all of the above. Two launchers, one
+board: **▶ Run all projects** (the queue, below) and the schedule-script select
+beside it. Under them, a per-project board — one row each, a live dot, the batch
+counter and FPS as they move, a bar, and a verdict when it lands — with the
+transcript streaming underneath. It is a board rather than a console because a
+run is hours long and unattended, where the only questions are which project is
+up, how far in, and whether anything broke; Control's console answers a
+different question and is still there for it.
 
-Opening the tab calls `/autorun/status` before subscribing, so a run started
-hours ago renders correctly rather than staying blank until the next frame.
-The rail badge shows a dot whenever a schedule is running, from any tab.
+Opening the tab calls `/autorun/status` **and** `/queue/status` before
+subscribing, so a run started hours ago renders correctly rather than staying
+blank until the next frame. The rail badge shows a dot whenever either is
+running, from any tab.
 
 ### The fleet schedule
 
@@ -760,6 +765,95 @@ There is no command allow-list, because unlike `/control/exec` the input is a
 file you wrote and put on the server, not a string typed into a web form.
 `AUTORUN_ALLOW_ANY_PATH=true` lifts the sandbox — only for a box where every
 API-token holder is already trusted with a shell on it.
+
+---
+
+## The project queue: every project, one button
+
+Running one project by hand is three gestures on the Control tab, and they are
+the same three gestures every time:
+
+| | select | run |
+|---|---|---|
+| 1 | the control server | `python3 server.py` |
+| 2 | all of stage 1 (the edges) | `python3 client.py --layer_id 1` |
+| 3 | all of stage 2 (the clouds) | `python3 client.py --layer_id 2` |
+
+The *only* thing that differs between one project and the next is the working
+directory those three run in. Six projects is eighteen gestures and one
+transposed directory away from a wasted afternoon.
+
+So `POST /queue/start` is that list, run in order. **⚙ Edit projects** on the
+Progress tab is where the list lives: a name, a directory, a tick to skip one
+without losing its place, an optional expected duration, and drag-free ↑↓
+ordering. **＋ from Control directories** pulls in the working directories
+already saved on the Control tab, since those are almost always the projects.
+
+It reuses `ssh/commands.py` rather than dialling its own sessions: the pool
+already holds those connections, the jump host is already configured, and the
+stored logins already resolve. `start_job`/`fan_out_jobs` are exactly what the
+Control tab presses, so a project launched from here is byte-for-byte one
+launched by hand — same pty, same live `exec_line` output, same `^C`.
+
+The commands are **not** stored with the projects. They are resolved at start
+from the Control tab's own presets, by the same rule its **select all** uses:
+`run server` for the control server, then `run <stage name>` falling back to
+`run stage <n>` for each stage in order. Rename a stage and its preset keeps
+matching; change a command once and every project runs the new one. A project
+that genuinely differs carries an `overrides` map (`{stage_id: command}`) — how
+`--device cpu` reaches one project's clients without forking the shared preset.
+
+### How a project is known to be finished
+
+**The server exits.** `server.py` ends when the video drains, so its exec job
+finishing *is* the completion signal — no log parsing, no guessed timeout, and
+nothing that goes stale when a log line is reworded. `autorun/fleet-3project.sh`
+already assumed exactly this.
+
+`budget_s` is a backstop, not a policy: when it expires the queue stops
+*waiting* and says so. It never kills the run — the archive is written at
+shutdown, so killing there would destroy the results the queue exists to
+collect. The next project's cleanup sweep deals with what is left.
+
+Between projects the fleet is swept (`pkill` for `client.py --layer_id` and
+`server.py`, `cleanup: false` to skip). This is not optional in practice: two
+servers both bind `rpc_queue`, and the next project's clients would register
+into the previous run's topology.
+
+### What the bars measure
+
+Four sources, and each bar uses the best one it actually has:
+
+| Bar | Denominator | Authority |
+|---|---|---|
+| queue | projects settled / projects planned (open one counts ½) | known before the first project starts |
+| project | `batch` / `total` | measured — read out of the server's own stdout |
+| project | elapsed / `expected_s` | estimated — the operator typed it in the editor, capped at 97% |
+| project | `phase` / `phases` | structural — server up, then each stage launched |
+
+Nothing invents a denominator. A project revealing none of the three gets no
+bar, which is the same rule the schedule scripts follow (`total=` or no bar) —
+a bar with a made-up denominator is worse than no bar, because it looks like
+knowledge. Hovering a bar says which source it used.
+
+The counters are lifted out of the server's output as it arrives, through
+`start_job(on_line=…)`. Only the server is watched: the clients print the same
+shapes, and nine of them writing the same keys would make the board flicker
+between whichever host spoke last.
+
+### One at a time
+
+A queue and a schedule script cannot run together, in either direction — a
+second start gets 409. They drive the same fleet, and two servers on one broker
+silently ruins both sets of numbers. Everything refusable is refused at
+`POST /queue/start`, while an HTTP request is still listening: no projects, no
+server login, no command saved for a stage. Failing at project four of six
+because stage 2 never had a preset wastes twenty minutes to report a typo.
+
+A directory grants nothing — it only ever reaches `cd`, `shlex.quote`d — so it
+is stored as typed. An override command *does* run, so it goes through the same
+allow-list as anything typed into the Control tab's command box, at
+`PUT /queue/projects`.
 
 ---
 

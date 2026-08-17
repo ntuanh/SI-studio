@@ -161,6 +161,11 @@ class Step:
 
     @property
     def duration_s(self) -> float:
+        # `started_at == 0` means the step is only planned, not begun -- the
+        # project queue puts its whole plan on the board up front. Without this
+        # a queued row would report the seconds since the epoch as its runtime.
+        if not self.started_at:
+            return 0.0
         return (self.finished_at or time.time()) - self.started_at
 
     def to_dict(self) -> dict[str, Any]:
@@ -378,6 +383,17 @@ class AutoRunner:
             raise AutoRunError(
                 f"auto-run {self._run.id} is already running ({self._run.script}). "
                 "Stop it first — these schedules drive the whole fleet."
+            )
+        # The other half of the same lock. A project queue drives the same
+        # fleet over SSH; a script starting beside it would put two servers on
+        # the same broker and silently ruin both sets of numbers. Imported here
+        # rather than at module scope because `project_queue` imports this one.
+        from .project_queue import runner as queue_runner
+
+        if queue_runner.active is not None:
+            raise AutoRunError(
+                "a project queue is already running. Stop it first — "
+                "these schedules drive the whole fleet."
             )
 
         path = self.resolve_script(script)

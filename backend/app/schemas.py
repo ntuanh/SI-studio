@@ -550,3 +550,39 @@ class AutoRunStartRequest(_Base):
 class AutoRunStopRequest(_Base):
     #: Seconds to wait at each rung of SIGINT → SIGTERM → SIGKILL.
     grace: float | None = None
+
+
+# -------------------------------------------------------------- project queue
+class QueueProjectIn(_Base):
+    """One row of the Progress tab's project editor."""
+
+    name: str = ""
+    path: str
+    enabled: bool = True
+    #: Typical runtime in seconds; 0 means "no estimate".
+    expected_s: int = 0
+    #: target -> command, keyed by `__server__` or a stage id. Empty for the
+    #: normal case, where every project runs the same three saved presets.
+    overrides: dict[str, str] = Field(default_factory=dict)
+
+
+class QueueProjectsIn(_Base):
+    projects: list[QueueProjectIn] = Field(default_factory=list)
+
+
+class QueueStartRequest(_Base):
+    """Run the saved projects one after another (`services/project_queue.py`)."""
+
+    #: Run only these project names. Empty runs every enabled one, which is what
+    #: the single button on the Progress tab sends.
+    only: list[str] = Field(default_factory=list)
+    #: `pkill` the previous project's server/clients across the fleet before
+    #: launching. Off only makes sense when every project shuts itself down
+    #: cleanly, which is not something this can verify.
+    cleanup: bool = True
+    #: Seconds to let one project run before giving up on it and moving to the
+    #: next. It is never killed for exceeding this — see the module docstring.
+    budget_s: int = 0
+    #: Master switch for this run's Telegram messages.
+    notify: bool = True
+    notify_steps: bool = True

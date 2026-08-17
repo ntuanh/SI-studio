@@ -19,7 +19,7 @@ import re
 import shlex
 import time
 import uuid
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -746,12 +746,25 @@ async def _open_process(
     return process, False
 
 
-async def _pump(job: ExecJob, *, timeout: float | None, stream: bool) -> CmdResult:
+async def _pump(
+    job: ExecJob,
+    *,
+    timeout: float | None,
+    stream: bool,
+    on_line: Callable[[str], None] | None = None,
+) -> CmdResult:
     """Read the job's output to EOF, publishing each line as it arrives.
 
     This is the difference between watching a run and staring at a spinner:
     lines reach the browser while the command is still going, instead of being
     accumulated and posted after it finishes.
+
+    `on_line` is for a caller that needs the same lines *while* they arrive
+    rather than in `result.stdout` at the end -- the project queue reads the
+    server's batch counter out of them (`services/project_queue.py`). It is
+    called inside the read loop, so it must not block and must not raise; a
+    misbehaving hook is caught here rather than being allowed to end a run it
+    was only supposed to watch.
     """
     process = job.process
     result = CmdResult(
@@ -770,6 +783,11 @@ async def _pump(job: ExecJob, *, timeout: float | None, stream: bool) -> CmdResu
                 break
             line = clean_pty_line(raw)
             collected.append(line)
+            if on_line is not None:
+                try:
+                    on_line(line)
+                except Exception:  # noqa: BLE001 - a watcher must not kill the run
+                    log.exception("output hook failed for job %s", job.id)
             if stream:
                 bus.exec_line(job.device_id, f"│  {line}", "stdout")
 
@@ -820,6 +838,7 @@ async def start_job(
     *,
     timeout: float | None = None,
     stream: bool = True,
+    on_line: Callable[[str], None] | None = None,
 ) -> ExecJob:
     """Open a channel, start `cmd`, and begin pumping its output.
 
@@ -858,7 +877,7 @@ async def start_job(
     # a fast command must not manage to do that before it was ever added.
     jobs.add(job)
     job.task = asyncio.create_task(
-        _pump(job, timeout=timeout, stream=stream), name=f"exec-{job.id}"
+        _pump(job, timeout=timeout, stream=stream, on_line=on_line), name=f"exec-{job.id}"
     )
     return job
 

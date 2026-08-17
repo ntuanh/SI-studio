@@ -265,6 +265,29 @@
     autorunHistory: function (limit) { return request('GET', '/autorun/history?limit=' + (limit || 20)); },
     autorunNotifyTest: function () { return request('POST', '/autorun/notify/test'); },
 
+    // --- project queue: every project, one button ------------------------
+    /* The other half of Progress. A schedule script is bash the operator wrote;
+     * this is the list of directories they would otherwise have re-typed into
+     * the Control tab's cwd box before each of three identical Runs. It drives
+     * the same SSH pool the Control tab does -- so the connections, the jump
+     * host and the stored logins are the ones already in use -- and reports
+     * over the same `autorun_*` frames the schedule board already renders. */
+    queueProjects: function () { return request('GET', '/queue/projects'); },
+    saveQueueProjects: function (projects) {
+      return request('PUT', '/queue/projects', { projects: projects });
+    },
+    queueStatus: function () { return request('GET', '/queue/status'); },
+    queueStart: function (opts) {
+      var body = {};
+      if (opts && opts.only) body.only = opts.only;
+      if (opts && opts.cleanup != null) body.cleanup = !!opts.cleanup;
+      if (opts && opts.budgetS) body.budget_s = opts.budgetS;
+      if (opts && opts.notify != null) body.notify = !!opts.notify;
+      if (opts && opts.notifySteps != null) body.notify_steps = !!opts.notifySteps;
+      return request('POST', '/queue/start', body);
+    },
+    queueStop: function () { return request('POST', '/queue/stop', {}); },
+
     // --- broker / server card -------------------------------------------
     /* `form` is the card's own shape: {ip, port, api_port, user, password}.
      * The password is write-only -- getServerConfig() returns has_credentials. */

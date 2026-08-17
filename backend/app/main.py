@@ -19,7 +19,18 @@ from .config import settings
 from .db import dispose_db, init_db
 from .inference.broker import broker
 from .inference.orchestrator import orchestrator
-from .routers import autorun, clusters, control, devices, metrics, reports, run, server, web
+from .routers import (
+    autorun,
+    clusters,
+    control,
+    devices,
+    metrics,
+    queue,
+    reports,
+    run,
+    server,
+    web,
+)
 from .services.autorun import runner as autorunner
 from .services.metrics_bus import bus
 from .ssh import gateway
@@ -109,6 +120,7 @@ app.include_router(run.router)
 app.include_router(metrics.router)
 app.include_router(reports.router)
 app.include_router(autorun.router)
+app.include_router(queue.router)
 
 
 # ------------------------------------------------------------------------ docs

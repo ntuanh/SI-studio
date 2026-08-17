@@ -5,6 +5,14 @@ refuses any path outside this directory (unless `AUTORUN_ALLOW_ANY_PATH=true`),
 because that endpoint executes a shell script with the control plane's own
 privileges — *which file runs* is the entire security boundary.
 
+> **You may not need a script at all.** If your projects differ only by which
+> directory the same three commands run in — server, then the edges, then the
+> clouds — use **▶ Run all projects** on the Progress tab instead. It runs the
+> list you edit there over the Control tab's own SSH sessions, with no bash to
+> write. Scripts are for the projects that need more: a config edit between
+> runs, a different launch order, a validator. See "The project queue" in
+> `backend/README.md`.
+
 `runs/` is written by the service: one folder per run, holding `manifest.json`
 (status, per-step timings, exit codes) and `output.log` (the full transcript).
 It is gitignored. Deleting a folder deletes that run from the history — there is

@@ -188,6 +188,37 @@ credential — that is what makes them committable, while `run/guides/*.md` and
 `controller/` (which do) are gitignored. Never inline a fleet password into
 `autorun/`.
 
+### The project queue is the other half of Progress, and it *is* remote
+
+`app/services/project_queue.py` runs the saved projects back to back over SSH,
+and unlike `autorun.py` it deliberately **reuses `ssh/commands.py`** —
+`start_job` / `fan_out` against the same pool the Control tab uses, so the
+connections, the jump host and the stored logins are the ones already in use.
+Don't give it its own dialling path.
+
+The split between the two is the shape of the work, not the transport:
+`fleet-3project.sh` exists because those three projects each have quirks needing
+a real language (PA's `server.clients = [9, 9]`, dmsf's `--device cpu`, per-project
+launch order). The queue exists because most projects differ *only* by directory,
+and writing bash to say "the same three commands, six times" is work the UI can
+simply not require. Both emit the same `autorun_*` frames, so one board renders
+either.
+
+Three invariants worth not breaking:
+
+- **The commands are not stored with the projects.** They resolve at start from
+  the Control tab's presets by the same rule its **select all** uses (`run server`,
+  then `run <stage name>` → `run stage <n>`). Storing a copy would let the button
+  and the tab drift, which is the bug the matching rule exists to prevent.
+- **A project ends when its server exits**, full stop. `budget_s` stops the queue
+  *waiting*; it never kills — the archive is written at shutdown.
+- **One lock across both launchers** (`_refuse_if_busy`, and the mirror of it in
+  `autorun.start`). Two servers on one broker silently ruins both sets of numbers.
+
+Progress bars take the best denominator they have — measured `batch/total`, then
+the operator's `expected_s`, then `phase/phases` — and **never invent one**. The
+same honesty rule the `::progress:: total=` marker has always followed.
+
 Two invariants worth not breaking: the child is spawned in **its own process
 group** (`start_new_session` / `CREATE_NEW_PROCESS_GROUP`) so stopping kills the
 `python server.py` it launched rather than orphaning it; and a run going quiet
@@ -230,9 +261,10 @@ backend/
                 gateway.py (__server__ target), secrets_store.py
     inference/  simulation.py (UI math port), broker.py (aio-pika), orchestrator.py (deploy/run/metrics)
     reports/    parse.py, charts.py, palette.py, store.py
-    routers/    devices, control, clusters, run, metrics, reports, autorun, web
+    routers/    devices, control, clusters, run, metrics, reports, autorun, queue, web
     services/   metrics_bus.py (pub/sub -> WS), topology.py (DB -> cluster shape),
-                autorun.py (local schedule scripts), notify.py (Telegram)
+                autorun.py (local schedule scripts), notify.py (Telegram),
+                project_queue.py (every project back to back, over the Control path)
   autorun/      operator schedule scripts + example; runs/ (gitignored) holds transcripts
   agent/        code that runs ON the devices: edge_agent.py, cloud_agent.py, codec.py, bootstrap.sh
   tools/        split_model.py (shard exporter), build_web.py (bundle -> web/)

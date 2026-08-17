@@ -218,6 +218,35 @@ class DirectoryPreset(SQLModel, table=True):
     position: int = 0
 
 
+class QueueProject(SQLModel, table=True):
+    """One project in the Progress tab's run-everything queue.
+
+    The whole feature exists because running a project by hand is three
+    identical gestures -- select the server and Run, select the edges and Run,
+    select the clouds and Run -- and the *only* thing that differs between one
+    project and the next is which directory those commands run in. So a project
+    is a directory with a name on it, and nothing else is required.
+
+    `overrides` is the escape hatch for the project that does differ: a map of
+    target -> command, keyed by `__server__` or a stage id, empty for the normal
+    case. It is how `--device cpu` gets onto one project's clients without
+    forking the shared preset every other project uses.
+    """
+
+    __tablename__ = "queueproject"
+
+    id: int | None = Field(default=None, primary_key=True)
+    name: str
+    path: str
+    enabled: bool = True
+    position: int = 0
+    #: Typical runtime in seconds, from the last few runs or from the operator.
+    #: Drives the elapsed-vs-expected bar; 0 means "no estimate", which shows
+    #: no such bar rather than a made-up one.
+    expected_s: int = 0
+    overrides: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+
+
 class AuditLog(SQLModel, table=True):
     """Record of destructive commands run through /control/exec."""
 
