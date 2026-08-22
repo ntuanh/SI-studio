@@ -36,3 +36,12 @@ cluster.py
 # every credential from the environment. It contains no password, and the
 # schedule cannot run without it, so it has to be committable.
 !backend/autorun/fleet.py
+
+# Result archives pulled off the fleet. Every run stores its own config.yaml,
+# and unlike backend/reports/ these have not been through the redaction step in
+# README.md -- they carry live RabbitMQ and SSH passwords. The shareable output
+# is docs/results/: rendered figures plus an explanation per case.
+visual_results/results static network/
+visual_results/results dynamic network/
+visual_results/missing/
+visual_results/__pycache__/
